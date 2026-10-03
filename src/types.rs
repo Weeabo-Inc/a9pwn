@@ -146,6 +146,16 @@ impl XferResult {
     /// that produced it is poisoned. Identified by the sentinel pair
     /// (`Error` + [`LIBUSB_ERROR_OTHER`] + an abort window) and never by
     /// `micros < 1`, so it cannot be confused with [`Self::timing_refuted`].
+    ///
+    /// **A transfer that was never submitted must never satisfy this.** libusb
+    /// owns no buffer in that case, so nothing is poisoned and claiming
+    /// otherwise would make a dead handle out of a live one. A failed
+    /// `libusb_submit_transfer` in particular keeps libusb's own
+    /// `LIBUSB_ERROR_*` code (not the `OTHER` sentinel) and carries no abort
+    /// window, so it is neither `unreaped` nor a timing claim — see
+    /// `usb::never_submitted`, which is the single construction site for every
+    /// such result, and `usb::submitted_result` for the one shape that may
+    /// legitimately set this.
     pub fn unreaped(&self) -> bool {
         self.status == XferStatus::Error
             && self.libusb_rc == LIBUSB_ERROR_OTHER
@@ -336,6 +346,15 @@ pub enum DriverClass {
     LibusbK,
     Libusb0,
     WinUsb,
+    /// Linux: no kernel driver is bound to the device (or its interface 0), so
+    /// libusb talks to it through `usbfs` on `/dev/bus/usb/<bus>/<addr>`.
+    ///
+    /// This is a *positive* measurement, not a fallback: it is read from the
+    /// absence of a `driver` symlink on the device/interface node in sysfs, which
+    /// is the state a DFU device is normally in on Linux, and it is what makes
+    /// `USBDEVFS_RESET` reachable. The variant exists so `ident` can say
+    /// `usbfs` instead of the uninformative `other`.
+    Usbfs,
     Other,
     Unknown,
 }
@@ -346,6 +365,7 @@ impl DriverClass {
             DriverClass::LibusbK => "libusbK",
             DriverClass::Libusb0 => "libusb0",
             DriverClass::WinUsb => "WinUSB",
+            DriverClass::Usbfs => "usbfs",
             DriverClass::Other => "other",
             DriverClass::Unknown => "unknown",
         }
@@ -360,6 +380,8 @@ impl DriverClass {
             DriverClass::Libusb0
         } else if s.contains("winusb") {
             DriverClass::WinUsb
+        } else if s.contains("usbfs") {
+            DriverClass::Usbfs
         } else if s.is_empty() {
             DriverClass::Unknown
         } else {
@@ -419,6 +441,16 @@ impl ResetEvidence {
 /// state transition, which is real evidence *when* the device was parked in
 /// [`crate::DFU_STATE_MANIFEST_WAIT_RESET`] before the reset.
 ///
+/// **Device evidence outranks the claim flag.** Leaving
+/// `MANIFEST_WAIT_RESET` for an idle state is the project's definition of
+/// positive evidence, and it cannot happen without a bus reset reaching the
+/// device; `interface_claimed` is only a snapshot taken at open. libusb
+/// auto-claims on the first control transfer (`windows_winusb.c:2985`), and
+/// `Transport::reset` issues one — the pre-reset `DFU_GETSTATUS` — before it
+/// resets, so `false` there does **not** prove the call was skipped. The flag
+/// still decides every case where the machine did *not* move, which is where a
+/// skip is a real explanation.
+///
 /// Note what is deliberately **not** claimed: idle before and idle after is
 /// exactly what a delivered host-initiated port reset looks like — libusbK's
 /// reset does not cycle VBUS, so the device keeps its address and its DFU
@@ -434,6 +466,21 @@ pub fn reset_evidence(
     dfu_state_before: Option<u8>,
     dfu_state_after: Option<u8>,
 ) -> ResetEvidence {
+    // The one cell that must not be gated on the claim snapshot: the device
+    // itself says a reset arrived. Returning `DriverCannotReset` here (which is
+    // what this did) makes `stages::reset_gate` STOP a run in which the reset
+    // was delivered — the exact false accusation this type exists to prevent.
+    if capability == ResetCapability::Real
+        && libusb_rc == LIBUSB_SUCCESS
+        && matches!(
+            (dfu_state_before, dfu_state_after),
+            (Some(crate::DFU_STATE_MANIFEST_WAIT_RESET), Some(after))
+                if after == crate::DFU_STATE_APP_IDLE || after == crate::DFU_STATE_DFU_IDLE
+        )
+    {
+        return ResetEvidence::Delivered;
+    }
+
     if capability != ResetCapability::Real || !interface_claimed {
         return ResetEvidence::DriverCannotReset;
     }
@@ -443,11 +490,6 @@ pub fn reset_evidence(
     }
 
     match (dfu_state_before, dfu_state_after) {
-        (Some(crate::DFU_STATE_MANIFEST_WAIT_RESET), Some(after))
-            if after == crate::DFU_STATE_APP_IDLE || after == crate::DFU_STATE_DFU_IDLE =>
-        {
-            ResetEvidence::Delivered
-        }
         (Some(crate::DFU_STATE_MANIFEST_WAIT_RESET), Some(crate::DFU_STATE_MANIFEST_WAIT_RESET)) => {
             ResetEvidence::Refuted
         }
@@ -491,11 +533,21 @@ impl ResetCapability {
     /// checkm8 needs a genuine bus reset — it is what runs the overwritten
     /// `dfu_handle_bus_reset` callback — so `WinUsb` here means the exploit
     /// cannot fire, whatever libusb returned.
+    ///
+    /// **Linux is deliberately NOT decided here.** `Usbfs` means "no kernel driver
+    /// is bound", which says nothing by itself about what a reset does — on Linux
+    /// the capability must be established from the *measured* evidence in `usb.rs`
+    /// (the interface claim plus what `libusb_reset_device`/`USBDEVFS_RESET`
+    /// actually did), never from the driver name. Do not "fix" this arm to
+    /// `Real`: doing so would let a name stand in for a measurement, which is the
+    /// one failure this project keeps paying for.
     pub fn from_driver(driver: DriverClass) -> ResetCapability {
         match driver {
             DriverClass::LibusbK | DriverClass::Libusb0 => ResetCapability::Real,
             DriverClass::WinUsb => ResetCapability::PipeCycleOnly,
-            DriverClass::Other | DriverClass::Unknown => ResetCapability::Unknown,
+            DriverClass::Usbfs | DriverClass::Other | DriverClass::Unknown => {
+                ResetCapability::Unknown
+            }
         }
     }
 }
@@ -552,7 +604,7 @@ mod tests {
         assert_eq!(id.cprv, Some(0x01));
         assert_eq!(id.bdid, Some(0x02));
         assert_eq!(id.ibfl, Some(0x1C));
-        assert_eq!(id.ecid, Some(0x001C_2460_08E0_13BA));
+        assert_eq!(id.ecid, Some(0x0011_2233_4455_66AA));
         assert_eq!(id.srtg.as_deref(), Some("IBOOT-2234.0.0.2.22"));
         assert!(id.is_a9());
         assert!(!id.is_pwned());
@@ -993,12 +1045,20 @@ mod tests {
     /// Capability and the claim gate the verdict, because libusb's success is
     /// fabricated: a WinUSB "reset" that reports success, and a libusbK reset
     /// that was skipped for want of a claimed interface, are both non-resets.
+    ///
+    /// **The one cell the gate must not decide** is pinned separately below: a
+    /// device that visibly left `MANIFEST_WAIT_RESET`. The claim flag is a
+    /// snapshot from open, and libusb auto-claims on the first control transfer
+    /// (`windows_winusb.c:2985`) — which `Transport::reset` performs for its
+    /// pre-reset `DFU_GETSTATUS` — so `false` does not prove the call was
+    /// skipped. Every case where the machine did *not* move stays gated.
     #[test]
     fn capability_and_claim_gate_the_verdict() {
         let parked = Some(crate::DFU_STATE_MANIFEST_WAIT_RESET);
         let idle = Some(crate::DFU_STATE_DFU_IDLE);
 
-        // WinUSB: reports success, cycles pipes.
+        // WinUSB: reports success, cycles pipes. The capability gate is
+        // absolute, transition or no transition.
         assert_eq!(
             reset_evidence(
                 ResetCapability::PipeCycleOnly,
@@ -1014,15 +1074,85 @@ mod tests {
             ResetEvidence::DriverCannotReset
         );
         // libusbK but interface 0 never claimed: libusb skips ResetDevice and
-        // still returns success.
+        // still returns success — so with no movement from the parked state,
+        // the skip *is* the explanation.
         assert_eq!(
-            reset_evidence(ResetCapability::Real, false, LIBUSB_SUCCESS, parked, idle),
+            reset_evidence(ResetCapability::Real, false, LIBUSB_SUCCESS, parked, parked),
+            ResetEvidence::DriverCannotReset
+        );
+        assert_eq!(
+            reset_evidence(
+                ResetCapability::Real,
+                false,
+                LIBUSB_SUCCESS,
+                Some(crate::DFU_STATE_APP_IDLE),
+                Some(crate::DFU_STATE_APP_IDLE)
+            ),
+            ResetEvidence::DriverCannotReset
+        );
+        assert_eq!(
+            reset_evidence(ResetCapability::Real, false, LIBUSB_SUCCESS, None, None),
             ResetEvidence::DriverCannotReset
         );
         // A failed call is never evidence of delivery, even with a transition.
         assert_eq!(
             reset_evidence(ResetCapability::Real, true, -4, parked, idle),
             ResetEvidence::Unverified
+        );
+        // …and neither is it `DriverCannotReset` when the interface was not
+        // claimed: the rc says this call failed, which is its own outcome.
+        assert_eq!(
+            reset_evidence(ResetCapability::Real, false, -4, parked, parked),
+            ResetEvidence::DriverCannotReset
+        );
+    }
+
+    /// Device evidence outranks the claim snapshot — the one cell that changed
+    /// when this was fixed, stated on its own so the decision is visible.
+    ///
+    /// Before: `(Real, claimed=false, rc=0, 8 -> 2)` was `DriverCannotReset`, so
+    /// `stages::reset_gate` returned `Stop` and a run in which the reset had
+    /// demonstrably been delivered was aborted with "the driver cannot reset".
+    /// A machine that left `MANIFEST_WAIT_RESET` was reset by something; if the
+    /// claim flag is the only thing saying otherwise, the flag is wrong, because
+    /// it was taken at open and libusb auto-claims on the first control transfer.
+    #[test]
+    fn a_transition_out_of_wait_reset_outranks_an_unclaimed_interface() {
+        for after in [crate::DFU_STATE_APP_IDLE, crate::DFU_STATE_DFU_IDLE] {
+            let e = reset_evidence(
+                ResetCapability::Real,
+                false,
+                LIBUSB_SUCCESS,
+                Some(crate::DFU_STATE_MANIFEST_WAIT_RESET),
+                Some(after),
+            );
+            assert_eq!(e, ResetEvidence::Delivered, "after={after}");
+            assert!(e.delivered());
+        }
+
+        // The capability gate still comes first: a WinUSB "reset" cannot have
+        // delivered anything, whatever the state machine appears to show, and
+        // saying otherwise would break the one verdict that protects the phone.
+        assert_eq!(
+            reset_evidence(
+                ResetCapability::PipeCycleOnly,
+                false,
+                LIBUSB_SUCCESS,
+                Some(crate::DFU_STATE_MANIFEST_WAIT_RESET),
+                Some(crate::DFU_STATE_DFU_IDLE)
+            ),
+            ResetEvidence::DriverCannotReset
+        );
+        // And a failed call is still not a delivery.
+        assert_eq!(
+            reset_evidence(
+                ResetCapability::Real,
+                false,
+                -4,
+                Some(crate::DFU_STATE_MANIFEST_WAIT_RESET),
+                Some(crate::DFU_STATE_DFU_IDLE)
+            ),
+            ResetEvidence::DriverCannotReset
         );
     }
 }

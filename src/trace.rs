@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::types::{Stage, XferResult, XferStatus};
+use crate::types::{ResetEvidence, Stage, XferResult, XferStatus};
 
 /// gaster's `send_usb_control_request_no_data(handle, 0x21, DFU_DNLOAD, 0, 0, 0x40)`
 /// "unstick" request (`gaster.c:856`).
@@ -69,12 +69,27 @@ pub const LIBUSB_DEV_ID_CAPACITY: usize = 256;
 /// Event kind strings. Use these rather than literals: [`Tracer::event`] counts
 /// resets and rounds by exact kind, and a typo would silently under-count.
 pub mod kind {
-    /// A port reset was attempted; delivery unknown.
+    /// A port reset was attempted but the call itself failed, so no
+    /// [`ResetEvidence`] could be produced: an attempt and nothing more.
     pub const RESET: &str = "reset";
-    /// A port reset was attempted and genuinely delivered.
+    /// A port reset was attempted and genuinely delivered — the DFU state machine
+    /// moved out of `MANIFEST_WAIT_RESET` afterwards
+    /// ([`ResetEvidence::Delivered`]).
     pub const RESET_REAL: &str = "reset_real";
-    /// A port reset returned success but only cycled pipes.
+    /// The driver **cannot** deliver a bus reset: libusb cycles pipes and returns
+    /// success anyway, or the interface the reset needs was never claimed
+    /// ([`ResetEvidence::DriverCannotReset`]). This is the only reset kind that
+    /// means `NO_RESET_CAPABILITY`.
     pub const RESET_PIPE_CYCLE: &str = "reset_pipe_cycle";
+    /// The device was parked in `MANIFEST_WAIT_RESET` and still was afterwards: it
+    /// says the reset did **not** happen ([`ResetEvidence::Refuted`]).
+    pub const RESET_REFUTED: &str = "reset_refuted";
+    /// The call returned on a driver that can reset, but the effect was observable
+    /// neither way ([`ResetEvidence::Unverified`]): this bootrom reports bState 5 at
+    /// rest and a full re-enumeration does not change it (MEASURED), while
+    /// [`ResetEvidence::Delivered`] needs the transition out of `MANIFEST_WAIT_RESET`
+    /// that only PATCH's walk arranges. Never a failure and never a success.
+    pub const RESET_UNVERIFIED: &str = "reset_unverified";
     /// One trip round the stage machine.
     pub const ROUND: &str = "round";
     /// A per-transfer record, written by [`super::Tracer::xfer`].
@@ -159,9 +174,25 @@ pub struct Counters {
     pub spray_leak_not_zero: u64,
 
     // ---- additive extension: resets and shape ----
-    /// Resets that returned success but only cycled pipes (libusb's WinUSB path
-    /// returns `LIBUSB_SUCCESS` without a bus reset, `windows_winusb.c:3380-3420`).
+    /// Resets the bound driver **cannot** deliver: WinUSB cycles pipes and returns
+    /// `LIBUSB_SUCCESS` anyway (`windows_winusb.c:3380-3420`), or the interface the
+    /// reset needs was never claimed ([`ResetEvidence::DriverCannotReset`]). This is
+    /// the measurement `NO_RESET_CAPABILITY` is about, and it means nothing else —
+    /// an unverifiable reset is [`Counters::resets_unverified`], never this.
     pub resets_pipe_cycle: u64,
+    /// Resets the device positively **refuted**: parked in `MANIFEST_WAIT_RESET`
+    /// before the reset and still parked after it
+    /// ([`ResetEvidence::Refuted`]). Measured non-delivery, and the only reset
+    /// evidence `RESET_NOT_DELIVERED` may rest on.
+    pub resets_refuted: u64,
+    /// Resets that returned on a driver that can reset with no observable state
+    /// change either way ([`ResetEvidence::Unverified`]). This is the **normal**
+    /// outcome after RESET, SETUP and SPRAY: this bootrom reports bState 5 at rest and
+    /// a full re-enumeration does not change it (MEASURED), so the transition
+    /// `Delivered` needs — which only PATCH's walk arranges — cannot occur there.
+    /// It proves neither delivery nor a driver fault, and no verdict may read it as
+    /// either. The live device produced exactly this.
+    pub resets_unverified: u64,
     /// `"STAGE/STATUS" -> exact count`, e.g. `"SETUP/TIMEOUT"`.
     pub stage_status: BTreeMap<String, u64>,
     /// Failed reference predicates reported by the stage machine, by stable code.
@@ -273,17 +304,33 @@ impl Counters {
 
     /// `"STAGE=count ..."` for every stage/status bucket ending in `status`, or
     /// `"none"`. Names *where* something happened — e.g. which stage lost the device.
+    ///
+    /// Buckets are stored in a `BTreeMap`, so iteration is byte-stable across
+    /// processes — but key order is *lexicographic*, which reads backwards against
+    /// the stage machine (`PATCH/…` sorts before `SETUP/…`). This renders them in
+    /// [`STAGE_ORDER`] instead, because the string answers "where did this happen",
+    /// and `verdict.rs` folds it into `evidence` for `DEVICE_LOST_MID_RUN`. Any key
+    /// that does not name a known stage is appended afterwards, in map order, so a
+    /// bucket can never be silently dropped.
     pub fn stages_with_status(&self, status: XferStatus) -> String {
         let suffix = format!("/{}", status.as_str());
-        let hits: Vec<String> = self
-            .stage_status
+        let canonical: Vec<String> = STAGE_ORDER
             .iter()
-            .filter(|(k, _)| k.ends_with(&suffix))
-            .map(|(k, v)| {
-                let stage = k.trim_end_matches(&suffix);
-                format!("{stage}={v}")
-            })
+            .map(|stage| Self::stage_status_key(*stage, status))
             .collect();
+
+        let mut hits: Vec<String> = Vec::new();
+        for key in &canonical {
+            if let Some(v) = self.stage_status.get(key) {
+                hits.push(format!("{}={v}", key.trim_end_matches(&suffix)));
+            }
+        }
+        for (k, v) in &self.stage_status {
+            if k.ends_with(&suffix) && !canonical.iter().any(|c| c == k) {
+                hits.push(format!("{}={v}", k.trim_end_matches(&suffix)));
+            }
+        }
+
         if hits.is_empty() {
             "none".to_string()
         } else {
@@ -309,20 +356,80 @@ impl Counters {
     pub fn abort_window_pinned(&self) -> bool {
         self.setup_attempts >= 2 && self.abort_sweep.len() == 1
     }
+
+    /// Attempts that produced **no** [`ResetEvidence`] at all: the reset call itself
+    /// failed, so the stage machine logged a bare [`kind::RESET`]
+    /// (`Tracer::event`) and no state was ever observed. A call that returned an
+    /// error delivered no bus reset — that is why these count as evidence of
+    /// non-delivery while an `Unverified` reset does not.
+    ///
+    /// Normally zero, because every successful call yields exactly one of the four
+    /// evidence states. A non-zero value is the only way a run can have attempts with
+    /// nothing observed about them.
+    pub fn resets_unrecorded(&self) -> u64 {
+        self.resets_attempted.saturating_sub(
+            self.resets_real + self.resets_refuted + self.resets_unverified + self.resets_pipe_cycle,
+        )
+    }
+
+    /// Is there **positive evidence that the port reset did not happen**?
+    ///
+    /// True in exactly two cases, both of them measurements:
+    ///
+    /// 1. the device refuted the reset — parked in `MANIFEST_WAIT_RESET` before and
+    ///    still parked after ([`Counters::resets_refuted`]);
+    /// 2. the reset call itself failed, so no evidence state exists for it
+    ///    ([`Counters::resets_unrecorded`]).
+    ///
+    /// Plus the guard that makes the claim true: nothing was delivered
+    /// (`resets_real == 0`), because a run with one delivered reset has no business
+    /// reporting non-delivery.
+    ///
+    /// Deliberately **false** for a run whose resets are all
+    /// [`ResetEvidence::Unverified`]: this bootrom rests at bState 5 and a full
+    /// re-enumeration does not change it (MEASURED), while `Delivered` needs a
+    /// transition only PATCH's walk arranges — so an unverifiable reset after
+    /// RESET/SETUP/SPRAY is evidence of nothing at all, in either direction. Firing on
+    /// the *absence* of positive delivery is the defect this method exists to prevent.
+    pub fn reset_non_delivery_measured(&self) -> bool {
+        self.resets_real == 0 && (self.resets_refuted > 0 || self.resets_unrecorded() > 0)
+    }
 }
+
+/// The stage machine's own order — `RESET → SETUP → SPRAY → PATCH → PWNED`
+/// (`gaster.c:1231-1276`, `INTERFACE.md` §4) — which is also [`Stage`]'s declaration
+/// order. Used to render per-stage summaries in pipeline order instead of the key
+/// order of the map they are stored in.
+const STAGE_ORDER: [Stage; 5] = [
+    Stage::Reset,
+    Stage::Setup,
+    Stage::Spray,
+    Stage::Patch,
+    Stage::Pwned,
+];
 
 /// Human-readable, stable one-line rendering of an exact counter set. Used by
 /// [`Tracer::summary_lines`] and by the verdict evidence.
+///
+/// The reset states are part of it on purpose: a counter nobody prints is a counter
+/// nobody trusts, and the reset counters are exactly the ones that were blurred once.
 pub fn counters_one_line(c: &Counters) -> String {
     format!(
-        "transfers={} ok={} stall={} timeout={} cancelled={} nodevice={} error={}",
+        "transfers={} ok={} stall={} timeout={} cancelled={} nodevice={} error={} \
+         resets_attempted={} resets_real={} resets_refuted={} resets_unverified={} \
+         resets_pipe_cycle={}",
         c.total(),
         c.ok,
         c.stall,
         c.timeout,
         c.cancelled,
         c.nodevice,
-        c.err
+        c.err,
+        c.resets_attempted,
+        c.resets_real,
+        c.resets_refuted,
+        c.resets_unverified,
+        c.resets_pipe_cycle
     )
 }
 
@@ -492,9 +599,11 @@ impl Tracer {
 
     /// Record a named event. `stage` is `None` for events that belong to no stage.
     ///
-    /// Kinds [`kind::RESET`], [`kind::RESET_REAL`], [`kind::RESET_PIPE_CYCLE`] and
-    /// [`kind::ROUND`] are counted exactly; anything else is recorded verbatim.
-    /// `detail` is passed through [`redact_ecid`].
+    /// The reset kinds [`kind::RESET`], [`kind::RESET_REAL`],
+    /// [`kind::RESET_PIPE_CYCLE`], [`kind::RESET_REFUTED`] and
+    /// [`kind::RESET_UNVERIFIED`], plus [`kind::ROUND`], are counted exactly;
+    /// anything else is recorded verbatim. `detail` is passed through
+    /// [`redact_ecid`].
     pub fn event(&mut self, kind_name: &str, stage: Option<Stage>, detail: &str) {
         match kind_name {
             kind::RESET => self.counters.resets_attempted += 1,
@@ -505,6 +614,14 @@ impl Tracer {
             kind::RESET_PIPE_CYCLE => {
                 self.counters.resets_attempted += 1;
                 self.counters.resets_pipe_cycle += 1;
+            }
+            kind::RESET_REFUTED => {
+                self.counters.resets_attempted += 1;
+                self.counters.resets_refuted += 1;
+            }
+            kind::RESET_UNVERIFIED => {
+                self.counters.resets_attempted += 1;
+                self.counters.resets_unverified += 1;
             }
             kind::ROUND => self.counters.rounds += 1,
             _ => {}
@@ -540,14 +657,23 @@ impl Tracer {
         }
     }
 
-    /// Typed shortcut for a port reset. Prefer this over a bare `event` string:
-    /// `delivered == false` means the call returned but only pipes were cycled,
-    /// which is a measurement, not a guess.
-    pub fn reset(&mut self, delivered: bool, note: &str) {
-        let k = if delivered {
-            kind::RESET_REAL
-        } else {
-            kind::RESET_PIPE_CYCLE
+    /// Typed shortcut for a port reset: record **what the evidence says**, not a
+    /// bool.
+    ///
+    /// `delivered: bool` used to be the parameter, and that collapse is a defect this
+    /// crate measured on hardware: an [`ResetEvidence::Unverified`] reset — the only
+    /// outcome available after RESET/SETUP/SPRAY, because this bootrom rests at bState 5
+    /// and `Delivered` needs a transition only PATCH's walk arranges — was counted as a
+    /// pipe cycle, and `verdict::classify` then blamed the driver for a failure that had
+    /// nothing to do with it. The four states now get four kinds and four counters
+    /// ([`Counters::resets_real`], [`Counters::resets_pipe_cycle`],
+    /// [`Counters::resets_refuted`], [`Counters::resets_unverified`]).
+    pub fn reset(&mut self, evidence: ResetEvidence, note: &str) {
+        let k = match evidence {
+            ResetEvidence::Delivered => kind::RESET_REAL,
+            ResetEvidence::DriverCannotReset => kind::RESET_PIPE_CYCLE,
+            ResetEvidence::Refuted => kind::RESET_REFUTED,
+            ResetEvidence::Unverified => kind::RESET_UNVERIFIED,
         };
         self.event(k, Some(Stage::Reset), note);
     }
@@ -702,8 +828,14 @@ impl Tracer {
             c.spray_leak_not_zero
         ));
         out.push(format!(
-            "    resets         : attempted={} real={} pipe_cycle={}",
-            c.resets_attempted, c.resets_real, c.resets_pipe_cycle
+            "    resets         : attempted={} real={} refuted={} unverified={} pipe_cycle={} \
+             unrecorded={}",
+            c.resets_attempted,
+            c.resets_real,
+            c.resets_refuted,
+            c.resets_unverified,
+            c.resets_pipe_cycle,
+            c.resets_unrecorded()
         ));
         out.push(format!("    rounds         : {}", c.rounds));
         out.push(format!(
@@ -1141,17 +1273,114 @@ mod tests {
     #[test]
     fn event_kinds_drive_the_reset_and_round_counters() {
         let mut t = Tracer::new(None, false).expect("tracer");
-        t.reset(true, "libusb rc=0, real bus reset");
-        t.reset(false, "libusb rc=0, pipe cycle only");
-        t.event(kind::RESET, Some(Stage::Reset), "attempted, outcome unknown");
+        t.reset(ResetEvidence::Delivered, "libusb rc=0, real bus reset");
+        t.reset(ResetEvidence::DriverCannotReset, "libusb rc=0, pipe cycle only");
+        t.reset(ResetEvidence::Refuted, "parked in MANIFEST_WAIT_RESET and still parked");
+        t.reset(ResetEvidence::Unverified, "idle before and after, state unread");
+        t.event(kind::RESET, Some(Stage::Reset), "attempted, call failed");
         t.round(1, "stage=SETUP");
         t.round(2, "stage=SETUP");
 
         let c = t.counters();
-        assert_eq!(c.resets_attempted, 3);
+        assert_eq!(c.resets_attempted, 5);
         assert_eq!(c.resets_real, 1);
         assert_eq!(c.resets_pipe_cycle, 1);
+        assert_eq!(c.resets_refuted, 1);
+        assert_eq!(c.resets_unverified, 1);
         assert_eq!(c.rounds, 2);
+        // The four states partition the attempts plus the bare `RESET` kind, so a
+        // reader can always account for every one of them.
+        assert_eq!(
+            c.resets_real + c.resets_pipe_cycle + c.resets_refuted + c.resets_unverified,
+            c.resets_attempted - 1
+        );
+    }
+
+    /// The defect measured on hardware: an `Unverified` reset was counted as a pipe
+    /// cycle, and `verdict::classify` then blamed a libusbK driver that was fine.
+    #[test]
+    fn an_unverified_reset_is_never_counted_as_a_pipe_cycle() {
+        let mut t = Tracer::new(None, false).expect("tracer");
+        t.reset(
+            ResetEvidence::Unverified,
+            "after RESET (round 1): rc=0 capability=\"real bus reset\" interface_claimed=true",
+        );
+        let c = t.counters();
+        assert_eq!(c.resets_attempted, 1);
+        assert_eq!(
+            c.resets_pipe_cycle, 0,
+            "an unverified reset is not a driver fault"
+        );
+        assert_eq!(c.resets_real, 0, "and it is not a delivery either");
+        assert_eq!(c.resets_unverified, 1);
+        assert!(
+            !c.reset_non_delivery_measured(),
+            "unverified proves no non-delivery"
+        );
+        // It is reported in the summary and the one-liner, not swallowed.
+        let s = t.summary_lines().join("\n");
+        assert!(s.contains("attempted=1 real=0 refuted=0 unverified=1 pipe_cycle=0"), "{s}");
+        assert!(counters_one_line(&c).contains("resets_unverified=1"), "{}", counters_one_line(&c));
+    }
+
+    /// Non-delivery is only *evidenced* when the device says so, or when the call
+    /// itself failed. The absence of a delivery is not evidence.
+    #[test]
+    fn non_delivery_needs_evidence_not_the_absence_of_delivery() {
+        // 1. The device refuted it: positive evidence.
+        let mut t = Tracer::new(None, false).expect("tracer");
+        t.reset(ResetEvidence::Refuted, "still in MANIFEST_WAIT_RESET after the reset");
+        let c = t.counters();
+        assert_eq!(c.resets_refuted, 1);
+        assert_eq!(c.resets_pipe_cycle, 0);
+        assert_eq!(c.resets_unverified, 0);
+        assert!(c.reset_non_delivery_measured());
+        assert_eq!(c.resets_unrecorded(), 0, "every attempt carried an evidence state");
+
+        // 2. The call itself failed: no evidence state exists, and a call that
+        //    returned an error delivered no bus reset. This is the ONLY legitimate
+        //    non-delivery with no `ResetEvidence` behind it, and it is exactly what
+        //    the stage machine records as a bare `reset` event.
+        let mut failed = Tracer::new(None, false).expect("tracer");
+        failed.event(kind::RESET, Some(Stage::Reset), "the reset call failed");
+        failed.event(kind::RESET, Some(Stage::Reset), "the reset call failed");
+        let f = failed.counters();
+        assert_eq!(f.resets_attempted, 2);
+        assert_eq!(f.resets_unrecorded(), 2, "two attempts, no evidence state");
+        assert!(f.reset_non_delivery_measured());
+
+        // 3. Unverifiable alone is NOT non-delivery — this was the defect.
+        let unverifiable = Counters {
+            resets_attempted: 3,
+            resets_unverified: 3,
+            ..Counters::default()
+        };
+        assert_eq!(unverifiable.resets_unrecorded(), 0);
+        assert!(
+            !unverifiable.reset_non_delivery_measured(),
+            "an unverifiable reset proves nothing in either direction"
+        );
+
+        // 4. A run that delivered anything has no business claiming non-delivery,
+        //    even alongside a refuted attempt.
+        let mixed_but_delivered = Counters {
+            resets_attempted: 3,
+            resets_real: 1,
+            resets_refuted: 1,
+            resets_unverified: 1,
+            ..Counters::default()
+        };
+        assert!(!mixed_but_delivered.reset_non_delivery_measured());
+
+        // 5. Refuted plus unverifiable, with nothing delivered, is still evidenced
+        //    non-delivery: the reader gets both numbers.
+        let refuted_and_unverifiable = Counters {
+            resets_attempted: 4,
+            resets_refuted: 1,
+            resets_unverified: 3,
+            ..Counters::default()
+        };
+        assert!(refuted_and_unverifiable.reset_non_delivery_measured());
     }
 
     #[test]
@@ -1179,7 +1408,7 @@ mod tests {
         t.flush();
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(!text.contains("00112233445566AA"), "{text}");
-        assert!(text.contains("ECID:...13BA"), "{text}");
+        assert!(text.contains("ECID:...66AA"), "{text}");
         assert!(text.contains("CPID:8003"), "{text}");
         assert!(text.contains("SRTG:[IBOOT-2234.0.0.2.22]"), "{text}");
     }
@@ -1189,8 +1418,8 @@ mod tests {
         assert_eq!(redact_ecid(""), "");
         assert_eq!(redact_ecid("no ecid here"), "no ecid here");
         assert_eq!(redact_ecid("ECID:AB"), "ECID:AB");
-        assert_eq!(redact_ecid("ECID:00112233445566AA"), "ECID:...13BA");
-        assert_eq!(redact_ecid("ECID:00112233445566AA."), "ECID:...13BA.");
+        assert_eq!(redact_ecid("ECID:00112233445566AA"), "ECID:...66AA");
+        assert_eq!(redact_ecid("ECID:00112233445566AA."), "ECID:...66AA.");
     }
 
     #[test]
@@ -1267,25 +1496,35 @@ mod tests {
         let path = tmp("discovery.jsonl");
         let mut t = Tracer::new(Some(path.clone()), false).expect("tracer");
         t.enumerated(&[(0x1227, 1)]);
-        t.device_path(271, "instance id read by our own SetupAPI pass");
+        // 121 bytes: a realistic `USB\VID_05AC&PID_1227\<descriptor tail>` instance
+        // ID, comfortably inside libusb's `char dev_id[256]`. This fixture used to
+        // inject 271 bytes and then assert it did *not* overflow, which contradicts
+        // itself — `verdict.rs` uses 271 where it genuinely wants the over-cap case
+        // (`DEVICE_PATH_TOO_LONG`). The boundary itself (255 ok, 256 and up flagged)
+        // is proven by `a_path_at_the_libusb_buffer_limit_is_flagged` below.
+        t.device_path(121, "instance id read by our own SetupAPI pass");
         t.open_failed(Some(-4), "libusb_open: NOT_FOUND for the only 1227 node");
         t.flush();
 
         let c = t.counters();
-        assert_eq!(c.device_path_len, Some(271));
+        assert_eq!(c.device_path_len, Some(121));
         assert_eq!(c.last_open_errno, Some(-4));
         assert!(c
             .last_open_error
             .as_deref()
             .unwrap()
             .contains("NOT_FOUND"));
-        assert!(!c.device_path_overflows_libusb(), "271 < 256 is false");
+        assert!(
+            !c.device_path_overflows_libusb(),
+            "121 bytes is under libusb's {}-byte dev_id buffer",
+            LIBUSB_DEV_ID_CAPACITY
+        );
 
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("\"kind\":\"enumerated\""), "{text}");
         assert!(text.contains("PID 0x1227=1"), "{text}");
         assert!(text.contains("\"kind\":\"device_path\""), "{text}");
-        assert!(text.contains("len=271"), "{text}");
+        assert!(text.contains("len=121"), "{text}");
         assert!(text.contains("\"kind\":\"open_failed\""), "{text}");
     }
 
@@ -1312,6 +1551,18 @@ mod tests {
         assert_eq!(c.stages_with_status(XferStatus::NoDevice), "SETUP=1 PATCH=1");
         assert_eq!(c.stages_with_status(XferStatus::Stall), "none");
         assert_eq!(c.stage_status(Stage::Patch, XferStatus::NoDevice), 1);
+
+        // The render follows the stage machine's order, not the map's lexicographic
+        // key order — "PATCH" sorts before "SETUP" ("RESET" before "SPRAY" too).
+        // Recorded out of pipeline order on purpose.
+        let mut full = Tracer::new(None, false).expect("tracer");
+        for stage in [Stage::Patch, Stage::Spray, Stage::Setup, Stage::Reset] {
+            full.xfer(stage, "lost", &xf(XferStatus::NoDevice, 0x21, 1, 0x40, 0, 0, None));
+        }
+        assert_eq!(
+            full.counters().stages_with_status(XferStatus::NoDevice),
+            "RESET=1 SETUP=1 SPRAY=1 PATCH=1"
+        );
     }
 
     #[test]
@@ -1342,11 +1593,18 @@ mod tests {
             cancelled: 4,
             nodevice: 5,
             err: 6,
+            resets_attempted: 4,
+            resets_real: 1,
+            resets_refuted: 1,
+            resets_unverified: 1,
+            resets_pipe_cycle: 1,
             ..Counters::default()
         };
         assert_eq!(
             counters_one_line(&c),
-            "transfers=21 ok=1 stall=2 timeout=3 cancelled=4 nodevice=5 error=6"
+            "transfers=21 ok=1 stall=2 timeout=3 cancelled=4 nodevice=5 error=6 \
+             resets_attempted=4 resets_real=1 resets_refuted=1 resets_unverified=1 \
+             resets_pipe_cycle=1"
         );
     }
 }
