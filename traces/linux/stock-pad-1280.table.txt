@@ -1,0 +1,58 @@
+ep0cut --mode sweep — wLength x latency on 05ac:1227
+  index: declared iSerialNumber 4 from the host-cached device descriptor (a pwn moves the marker to a different index; a hardcoded index is how a tool reports the wrong string)
+  shapes: ["pad", "getdesc"]
+  lengths: [0, 64, 1280]  repeats: 3  rows: 18
+  per-row deadline: 250 ms (libusb's timeout). THIS TOOL NEVER CANCELS; a TIMED_OUT row does not stop the ladder. reset-between: true
+  OUT data pattern: Zeros
+  NOTE: this sends the exploit's own request shapes. It is a measurement tool, not a pwn.
+
+  round shape     wLength  status        sz         us
+      0 pad             0  STALL          0        154
+      0 pad            64  STALL          0        177
+      0 pad          1280  TIMED_OUT     64     250084
+            (row ended TIMED_OUT; libusb's timeout cancels the URB internally — this is the EP0 wedge risk)
+            (port reset: rc=0; the measured recovery)
+      0 getdesc         0  COMPLETED      0         51
+      0 getdesc        64  COMPLETED     64         51
+      0 getdesc      1280  COMPLETED    198        132
+      1 pad             0  STALL          0        158
+      1 pad            64  STALL          0        172
+      1 pad          1280  TIMED_OUT     64     250113
+            (row ended TIMED_OUT; libusb's timeout cancels the URB internally — this is the EP0 wedge risk)
+            (port reset: rc=0; the measured recovery)
+      1 getdesc         0  COMPLETED      0         68
+      1 getdesc        64  COMPLETED     64         73
+      1 getdesc      1280  COMPLETED    198        174
+      2 pad             0  STALL          0        169
+      2 pad            64  STALL          0        174
+      2 pad          1280  TIMED_OUT     64     250151
+            (row ended TIMED_OUT; libusb's timeout cancels the URB internally — this is the EP0 wedge risk)
+            (port reset: rc=0; the measured recovery)
+      2 getdesc         0  COMPLETED      0         78
+      2 getdesc        64  COMPLETED     64         82
+      2 getdesc      1280  COMPLETED    198        154
+
+  ---- per point (median of N repeats) ----
+  shape     wLength  N   median_us    min_us    max_us  spread     sz  statuses
+  pad             0  3         158       154       169      15      0  STALLx3
+  pad            64  3         174       172       177       5      0  STALLx3
+  pad          1280  3      250113    250084    250151      67     64  TIMED_OUTx3
+  getdesc         0  3          68        51        78      27      0  COMPLETEDx3
+  getdesc        64  3          73        51        82      31     64  COMPLETEDx3
+  getdesc      1280  3         154       132       174      42    198  COMPLETEDx3
+
+
+  ---- controls ----
+  C1 OK — GET_DESCRIPTOR answered with up to 198 bytes in 2 points
+  C2 WEAK — only 1 GET_DESCRIPTOR point(s) returned the full 198-byte answer; two asked lengths are needed to test host drift
+  C3 baseline (wLength 0): pad=158 us (STALLx3), getdesc=68 us (COMPLETEDx3)
+
+  ---- what the data supports (INFERRED from this ladder alone) ----
+  pad (bm=00 b=00 wValue=0 wIndex=0 (pad, gaster.c:853)) — DATA CONSUMPTION (a) SUPPORTED
+      served calibration = 38.7 us per 64-byte packet (n=2 GET_DESCRIPTOR points)
+      noise floor = 67 us (largest same-status repeat spread)
+      Pad slope over all lengths = 12792.6 us/packet (n=3)
+      exploit length 1280 B: median 250113 us vs 158 us at wLength 0 (12497.8 us per 64-byte packet over 20.00 packets)
+      FALSIFIED IF: a repeat of the Pad row at its longest length lands within the noise floor (67 us) of the wLength-0 row (that is explanation (b)), or if the GET_DESCRIPTOR rows that return the SAME byte count at different asked lengths show the same slope (then the slope is a host artifact, not the device).
+
+  A slope through a handful of points is NOT a measurement of the ROM's behaviour. What would make it solid: more repeats, a second run on a re-enumerated device, and the same ladder at a different host load.

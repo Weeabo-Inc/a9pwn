@@ -1,0 +1,3 @@
+{"seq":1,"stage":"RESET","kind":"single_stage_start","t_micros":46,"detail":"precondition=none usb_timeout=5ms leak_windex=0xA"}
+{"seq":2,"stage":"-","kind":"no_device","t_micros":10795180,"detail":"no DFU device after 600 open attempts (~3000 ms): 1 Apple device(s) present, PID(s) 024F, none in DFU mode (1227). A device in recovery or normal mode is not exploitable — it must be put back into DFU."}
+{"seq":3,"stage":"RESET","kind":"run_end","t_micros":10795191,"detail":"NoDevice"}

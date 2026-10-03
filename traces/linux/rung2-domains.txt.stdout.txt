@@ -1,0 +1,51 @@
+# a9boot firstlight — 6 packet(s), 6 exchange(s)
+  [0] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e80110 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d000000000000000010003880010000001001e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  [1] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e802b0 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d00000000000000001000388001000000b002e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  [2] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e802b8 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d00000000000000001000388001000000b802e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  [3] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e80110 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d000000000000000010003880010000001001e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  [4] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e802b0 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d00000000000000001000388001000000b002e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  [5] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   20  memc read 0x20e802b8 len 0x4
+       purpose: explicit address (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d00000000000000001000388001000000b802e8200000000004000000000000000000000000000000000000000000000000000000000000000000000000000000
+  sequence: reference
+    step 1: DNLOAD command (72 bytes, 1 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0
+    step 2: DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987
+    step 3: DNLOAD wLength 0 — the end of the download — gaster.c:833
+    step 4: DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833
+    step 5: DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST)
+    step 6: DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET)
+    step 7: UPLOAD wLength 20 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger
+
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          DFU_GET_STATUS (read-only): status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+note          DFU_GET_STATUS before the first exchange: status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+WARNING       the DFU state is 8 (dfuMANIFEST-WAIT-RESET), not dfuIDLE. A DNLOAD that starts a *fresh* download is expected only in dfuIDLE; in any other state the ROM may append at an offset the host cannot see. If the first exchange fails, that is the first hypothesis to exclude, and a bus reset (`a9boot reset is Lead-only`) is the way back to dfuIDLE — not a retry.
+[0] memc read 0x20e80110 len 0x4: NO REPLY (status TIMEOUT) — LIVE_UPLOAD_FAILED[status=TIMEOUT] (memc read 0x20e80110 len 0x4): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+[1] memc read 0x20e802b0 len 0x4: NO REPLY (status TIMEOUT) — LIVE_DNLOAD_FAILED[status=TIMEOUT] at +0x0 of 72: Operation timed out
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+[2] memc read 0x20e802b8 len 0x4: NO REPLY (status TIMEOUT) — LIVE_DNLOAD_FAILED[status=TIMEOUT] at +0x0 of 72: Operation timed out
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+[3] memc read 0x20e80110 len 0x4: NO REPLY (status TIMEOUT) — LIVE_DNLOAD_FAILED[status=TIMEOUT] at +0x0 of 72: Operation timed out
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+[4] memc read 0x20e802b0 len 0x4: NO REPLY (status TIMEOUT) — LIVE_DNLOAD_FAILED[status=TIMEOUT] at +0x0 of 72: Operation timed out
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+[5] memc read 0x20e802b8 len 0x4: NO REPLY (status TIMEOUT) — LIVE_DNLOAD_FAILED[status=TIMEOUT] at +0x0 of 72: Operation timed out
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 20, sequence reference
+
+VERDICT       FAIL — [0] memc read 0x20e80110 len 0x4: NO REPLY (status TIMEOUT) — LIVE_UPLOAD_FAILED[status=TIMEOUT] (memc read 0x20e80110 len 0x4): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+
+evidence written to a9pwn-traces/linux/rung2-domains.json (schema a9boot.evidence/1)

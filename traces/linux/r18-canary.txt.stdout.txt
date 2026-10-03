@@ -1,0 +1,27 @@
+# a9boot firstlight — 1 packet(s), 1 exchange(s)
+  [0] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   48  memc read 0x1800e0f08 len 0x20
+       purpose: SRAM (ROM heap / DFU buffer / resident handler) (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d00000000000000001000388001000000080f0e800100000020000000000000000000000000000000000000000000000000000000000000000000000000000000
+  sequence: reference
+    step 1: DNLOAD command (72 bytes, 1 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0
+    step 2: DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987
+    step 3: DNLOAD wLength 0 — the end of the download — gaster.c:833
+    step 4: DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833
+    step 5: DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST)
+    step 6: DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET)
+    step 7: UPLOAD wLength 48 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger
+
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          DFU_GET_STATUS (read-only): status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+note          DFU_GET_STATUS before the first exchange: status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+WARNING       the DFU state is 8 (dfuMANIFEST-WAIT-RESET), not dfuIDLE. A DNLOAD that starts a *fresh* download is expected only in dfuIDLE; in any other state the ROM may append at an offset the host cannot see. If the first exchange fails, that is the first hypothesis to exclude, and a bus reset (`a9boot reset is Lead-only`) is the way back to dfuIDLE — not a retry.
+WARNING       PROVENANCE UNVERIFIED: this run made a single exchange, so nothing in it separates 'our command ran' from 'the buffer already began with DONE_MAGIC and the handler echoed it' (the handler re-sends the buffer unchanged when the command magic does not match, payload_handle_checkm8_request.S:68-74). `DONE_MAGIC` is INSPECTED from the reference, not measured on this device. A second read to a *different* address, or `--write`, is what upgrades this reply from 'the channel answered' to 'the channel answered *this* request'.
+[0] memc read 0x1800e0f08 len 0x20: status OK, actual_length 48/48, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 32 reply bytes, 667 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 48, sequence reference
+
+VERDICT       PASS
+
+evidence written to a9pwn-traces/linux/r18-canary.json (schema a9boot.evidence/1)

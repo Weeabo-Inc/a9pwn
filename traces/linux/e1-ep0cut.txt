@@ -1,0 +1,16 @@
+ep0cut — GET_DESCRIPTOR(3,4) wLength=255 on 05ac:1227
+          ladder (us): [0, 50, 100, 150, 300, 2000]   reset-between: true
+
+     asked   achieved  status     libusb sz  head
+       0us      197us  CANCELLED       0/255  
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+      50us      341us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+     100us     1673us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+     150us      965us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+     300us      188us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+    2000us      180us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+
+  control 1 (deadline 0us): OK — a zero-deadline cancel really does produce CANCELLED/0
+  control 2 (deadline 2000us): FAILED — expected COMPLETED/255 bytes, got COMPLETED/198 — the device is NOT answering, so every other row is meaningless
+
+  VERDICT  INVALID LADDER — fix the controls before reading anything below.

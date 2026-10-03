@@ -1,0 +1,144 @@
+{
+  "schema": "a9boot.evidence/1",
+  "tool": "a9boot-host",
+  "tool_version": "0.1.0",
+  "command": "a9boot-host firstlight --live --sequence reference --read 0x20c000038:8 --read 0x20c000030:8 --json a9pwn-traces/linux/rung2-fresh-2.json",
+  "mode": "live",
+  "build": {
+    "usb_feature": true,
+    "dnload_chunk": 2048,
+    "reply_off": 16,
+    "payload_off": 272
+  },
+  "started_utc": "2026-10-03T13:29:35Z",
+  "finished_utc": "2026-10-03T13:29:35Z",
+  "wall_clock_ms": 11,
+  "success_criterion": "actual_length == wLength AND the reply begins with [DONE_MAGIC][retval]; the channel, the requested length and the transfer status are diagnostics and cannot establish success on their own",
+  "transport": "LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.",
+  "device": {
+    "identity_checked": true,
+    "identity": "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]",
+    "identity_error": null,
+    "serial": "REDACTED (never published)"
+  },
+  "exchanges": [
+    {
+      "index": 0,
+      "label": "memc read 0x20c000038 len 0x8",
+      "purpose": "AUSB_CFG0/CFG1 (PHY tunables the SecureROM programmed) (read-only; the only bytes written are inside the ROM's DFU buffer)",
+      "request": {
+        "bmRequestType": "0x21",
+        "bRequest": "0x01 (DFU_DNLOAD)",
+        "wValue": "0x0000",
+        "wIndex": "0x0000",
+        "dnload_len": 72,
+        "dnload_transfers": 1,
+        "dnload_hex": "636d656d636d656d000000000000000010003880010000003800000c0200000008000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "dnload_sha256": "38e040c167a7b744bbd1cb4c8508170107c156330179cdf26bd3d72c435961fa",
+        "sequence": "reference",
+        "sequence_steps": "DNLOAD command (72 bytes, 1 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0 | DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987 | DNLOAD wLength 0 — the end of the download — gaster.c:833 | DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833 | DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST) | DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET) | UPLOAD wLength 24 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger"
+      },
+      "trigger": {
+        "bmRequestType": "0xa1",
+        "bRequest": "0x02 (DFU_UPLOAD)",
+        "wValue": "0xffff",
+        "wIndex": "0x0000",
+        "wLength": 24
+      },
+      "start_us": 211,
+      "duration_us": 10155,
+      "status": "OK",
+      "actual_length": 24,
+      "channel": "0x21/0x01 DNLOAD then 0xa1/0x02 wValue 0xffff UPLOAD",
+      "response": {
+        "bytes_read": 24,
+        "complete": true,
+        "upload_hex": "656e6f64656e6f641000388001000000f3233737040e0200",
+        "upload_sha256": "3c4c917b8fff8a6ff8630d02e3eef41f45038dce858b6fe7a03e08dc4e15d636"
+      },
+      "transport_error": null,
+      "parse": {
+        "state": "PARSED",
+        "reason": null,
+        "magic_hex": "0x646f6e65646f6e65",
+        "magic_ascii": "donedone",
+        "done_magic_ok": true,
+        "retval_hex": "0x0000000180380010",
+        "retval_label": "UNKNOWN_STATUS",
+        "data_len": 8,
+        "data_hex": "f3233737040e0200"
+      },
+      "exchange_verdict": "PASS"
+    },
+    {
+      "index": 1,
+      "label": "memc read 0x20c000030 len 0x8",
+      "purpose": "AUSB_CTL/AUSB_SIG (PHY control and signal state) (read-only; the only bytes written are inside the ROM's DFU buffer)",
+      "request": {
+        "bmRequestType": "0x21",
+        "bRequest": "0x01 (DFU_DNLOAD)",
+        "wValue": "0x0000",
+        "wIndex": "0x0000",
+        "dnload_len": 72,
+        "dnload_transfers": 1,
+        "dnload_hex": "636d656d636d656d000000000000000010003880010000003000000c0200000008000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "dnload_sha256": "c022f850675038ffa23307449d97c078dd3969d307e72514b74d372e7716eca8",
+        "sequence": "reference",
+        "sequence_steps": "DNLOAD command (72 bytes, 1 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0 | DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987 | DNLOAD wLength 0 — the end of the download — gaster.c:833 | DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833 | DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST) | DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET) | UPLOAD wLength 24 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger"
+      },
+      "trigger": {
+        "bmRequestType": "0xa1",
+        "bRequest": "0x02 (DFU_UPLOAD)",
+        "wValue": "0xffff",
+        "wIndex": "0x0000",
+        "wLength": 24
+      },
+      "start_us": 10392,
+      "duration_us": 1383,
+      "status": "OK",
+      "actual_length": 24,
+      "channel": "0x21/0x01 DNLOAD then 0xa1/0x02 wValue 0xffff UPLOAD",
+      "response": {
+        "bytes_read": 24,
+        "complete": true,
+        "upload_hex": "656e6f64656e6f6410003880010000001000000003c10100",
+        "upload_sha256": "3f3f91fdf023f5f6a90eae2f5be94d786a7b74c4181b1044d9c1b7fcac352871"
+      },
+      "transport_error": null,
+      "parse": {
+        "state": "PARSED",
+        "reason": null,
+        "magic_hex": "0x646f6e65646f6e65",
+        "magic_ascii": "donedone",
+        "done_magic_ok": true,
+        "retval_hex": "0x0000000180380010",
+        "retval_label": "UNKNOWN_STATUS",
+        "data_len": 8,
+        "data_hex": "1000000003c10100"
+      },
+      "exchange_verdict": "PASS"
+    }
+  ],
+  "notes": [
+    "identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present",
+    "DFU_GET_STATUS (read-only): status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]",
+    "DFU_GET_STATUS before the first exchange: status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]",
+    "AUSB_CFG0 = 0x373723f3, AUSB_CFG1 = 0x00020e04 — non-zero and stable-looking: these are the values to pass as `apple,cfg0-device` / `apple,cfg1-device` (U-13)",
+    "AUSB_CTL = 0x00000010 (bit0 RESET, bit2 PWRDOWN, bit3 SIDDQ): a control bit is SET, so the PHY is not in the DFU-idle state and this read is context, not a tunable; AUSB_SIG = 0x0001c103 (bit1 VBUSDET_FORCE_EN, bit8 CABLE_CONNECTED): CABLE_CONNECTED is set"
+  ],
+  "warnings": [
+    "the DFU state is 8 (dfuMANIFEST-WAIT-RESET), not dfuIDLE. A DNLOAD that starts a *fresh* download is expected only in dfuIDLE; in any other state the ROM may append at an offset the host cannot see. If the first exchange fails, that is the first hypothesis to exclude, and a bus reset (`a9boot reset is Lead-only`) is the way back to dfuIDLE — not a retry."
+  ],
+  "dfu_status_before": {"status": 0, "state": 8, "state_name": "dfuMANIFEST-WAIT-RESET", "accepts_a_fresh_dnload": false},
+  "read_0x20c000038": {"addr": "0x20c000038", "len": 8, "interpretation": "AUSB_CFG0 = 0x373723f3, AUSB_CFG1 = 0x00020e04 — non-zero and stable-looking: these are the values to pass as `apple,cfg0-device` / `apple,cfg1-device` (U-13)"},
+  "read_0x20c000030": {"addr": "0x20c000030", "len": 8, "interpretation": "AUSB_CTL = 0x00000010 (bit0 RESET, bit2 PWRDOWN, bit3 SIDDQ): a control bit is SET, so the PHY is not in the DFU-idle state and this read is context, not a tunable; AUSB_SIG = 0x0001c103 (bit1 VBUSDET_FORCE_EN, bit8 CABLE_CONNECTED): CABLE_CONNECTED is set"},
+  "not_proved_by_this_run": [
+    "the channel bindings (bmRequestType/bRequest/wValue/magic offsets) are INSPECTED from research/refs/gaster/payload_handle_checkm8_request.S, not MEASURED on this device: UNVERIFIED-BY-TEST until an exchange parses",
+    "that DONE_MAGIC in a reply proves OUR handler ran rather than the ROM echoing a buffer that happened to begin with it",
+    "that the ROM's DNLOAD write offset resets between commands (tested by two exchanges in one session to two *different* addresses, i.e. two --read options)",
+    "anything about DRAM: extent, reachability from EL3, or usability (that is the DRAM walk, a separate step)",
+    "that the a9boot payload can be executed at abi::payload_exec_addr() (EXEC is a separate step and UNVERIFIED-BY-TEST)"
+  ],
+  "verdict": "PASS",
+  "verdict_reason": null
+}

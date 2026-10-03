@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host firstlight --live --sequence reference --read 0x20E80110:4 --read 0x20E802B0:4 --read 0x20E802B8:4 --read 0x20E80110:4 --read 0x20E802B0:4 --read 0x20E802B8:4 --json a9pwn-traces/linux/rung2-domains.json
+exit_code     : 5
+wall_ms       : 6014
+capture_bytes : 2274
+capture_lines : 30
+capture_sha256: d1920124769d5f9c3e835c531e8c95d9103c19edb79213d383f1aa57f666ced8
+stdout        : a9pwn-traces/linux/rung2-domains.txt.stdout.txt

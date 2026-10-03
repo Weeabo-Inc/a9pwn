@@ -1,0 +1,8 @@
+a9pwn selftest (offline; does not touch the device)
+  [ok]   blob sha256 verified
+  [info] sizeof(A9)=104 sizeof(handle_checkm8_request)=56
+  [info] 2 SoC config(s) in the table
+         cpid=0x8003 cprv=0x01 s8003 Malta pad=0x500 large_leak=0 hole=0
+         cpid=0x8000 cprv=0x20 s8000 Maui pad=0x500 large_leak=0 hole=0
+
+  selftest: PASS

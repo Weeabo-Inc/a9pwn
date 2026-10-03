@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host pagewalk --live --lookup 0x1800e0f08 --lookup 0x180380110 --lookup 0x800000000 --lookup 0x20e80110 --json a9pwn-traces/linux/r20-pagewalk.json
+exit_code     : 7
+wall_ms       : 29
+capture_bytes : 13740
+capture_lines : 186
+capture_sha256: 2b59eb69d3ddb249346eb47650e3cc6e89ef7917d197d01115a4f1b2e304b89c
+stdout        : a9pwn-traces/linux/r20-pagewalk.txt.stdout.txt

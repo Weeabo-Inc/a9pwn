@@ -1,0 +1,33 @@
+# a9boot capacity — the U-2 ladder (how large ONE command can be).
+  required command   0x2be8 bytes (PAYLOAD_OFF 0x110 + the 10,640-byte payload image)
+  assumed capacity   0x4000 bytes (the value every budget in this tree uses, unmeasured)
+  ladder (command bytes, data = command - 72): ["0x800", "0x1000", "0x2000", "0x2be8", "0x4000"]
+  each step is ONE command whose header is memcpy(0,0,0): no destination, no source, no
+  length. It writes nothing anywhere, and the reply echoes the appended data back for
+  comparison. The ladder stops at the first step that does not come back intact.
+
+capacity is at least 0x1000 bytes (4096) and BELOW 0x2000 (8192). The failing step is a hard ceiling for one command: every command budget must be re-planned against 0x1000, not against the assumed 0x4000.
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          DFU_GET_STATUS (read-only): status 0 (OK) state 7 (dfuMANIFEST) [raw 0x00 b8 0b 00 0x07 0x00]
+note          DFU state before the ladder: status 0 (OK) state 7 (dfuMANIFEST) [raw 0x00 b8 0b 00 0x07 0x00]
+note          ladder [2048, 4096, 8192, 11240, 16384] COMMAND bytes; the required command is 0x2be8 bytes. Each step is ONE command whose header is memcpy(0,0,0) — no destination, no source, no length — so nothing is written except the DNLOAD itself, and the reply carries the appended data back for comparison
+note          safety arithmetic: the resident handler is at 0x1800e0f08, the buffer at 0x180380000, and they are 0x29f0f8 = 2 MiB apart — no ladder step that stops at 0x4000 can reach the code it is measuring with
+note          1976 data bytes arrived intact (2048 byte command, 1 DNLOAD transfers)
+note          4024 data bytes arrived intact (4096 byte command, 2 DNLOAD transfers)
+note          CAPACITY_STEP_REFUSED: no reply: LIVE_UPLOAD_FAILED[status=INVALID_PARAM] (capacity step 8192 command bytes (8120 data)): Invalid parameter. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+note          STOPPING at 8192 command bytes: the next step would be a larger write past the point that just failed, into SRAM whose contents are unknown, for no extra information
+WARNING       CAPACITY_INSUFFICIENT: the largest command the loader must send is 11240 bytes (PAYLOAD_OFF 0x110 + the 10,640-byte payload image), but the ladder only verified 0x1000 bytes. Delivering the payload through this channel would overrun the capacity that was measured, which is corruption rather than a stall. Re-cut the payload smaller, or stream it in pieces, before any upload.
+WARNING       the ASSUMED capacity (0x4000) is above the measured bracket: every budget in this                  tree that uses `TransferBudget::default()` is now known to be optimistic, and                  U-2 must be recorded as a measured ceiling, not an assumption.
+[0] capacity step 2048 command bytes (1976 data): status OK, actual_length 2048/2048, DONE_MAGIC + retval 0x0 (OK), 2032 reply bytes, 3541 µs
+              DNLOAD 2048 bytes in 1 transfer(s), UPLOAD wLength 2048, sequence reference
+[1] capacity step 4096 command bytes (4024 data): status OK, actual_length 4096/4096, DONE_MAGIC + retval 0x0 (OK), 4080 reply bytes, 6697 µs
+              DNLOAD 4096 bytes in 2 transfer(s), UPLOAD wLength 4096, sequence reference
+[2] capacity step 8192 command bytes (8120 data): NO REPLY (status INVALID_PARAM) — LIVE_UPLOAD_FAILED[status=INVALID_PARAM] (capacity step 8192 command bytes (8120 data)): Invalid parameter. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+              DNLOAD 8192 bytes in 4 transfer(s), UPLOAD wLength 8192, sequence reference
+
+VERDICT       FAIL — CAPACITY_INSUFFICIENT: the largest command the loader must send is 11240 bytes (PAYLOAD_OFF 0x110 + the 10,640-byte payload image), but the ladder only verified 0x1000 bytes. Delivering the payload through this channel would overrun the capacity that was measured, which is corruption rather than a stall.
+
+evidence written to a9pwn-traces/linux/r18-capacity.json (schema a9boot.evidence/1)

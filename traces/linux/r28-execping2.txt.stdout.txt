@@ -1,0 +1,20 @@
+capacity   0x2be8 command bytes, from --capacity (TYPED BY HAND: not traceable to a run — prefer --capacity-from)
+  capacity     0x2be8 command bytes (measured; the ladder's lower bound)
+# a9boot exec — payload a9boot/target/aarch64-unknown-none-softfloat/payload/a9boot-payload -> flat: base 0x180380110, 10968 bytes delivered + 0 bytes .bss = 10968 bytes footprint (budget 16384), entry 0x180380110
+  command      EXEC PING (1), packet 11240 bytes = 6 DNLOAD transfers
+  staged at    0x180380110 (entry 0x180380110), inside the ROM's DFU buffer
+  verification 6 read-back chunk(s) of 2048 bytes, compared byte for byte
+  sequence     reference
+    step 1: DNLOAD command (11240 bytes, 6 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0
+    step 2: DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987
+    step 3: DNLOAD wLength 0 — the end of the download — gaster.c:833
+    step 4: DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833
+    step 5: DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST)
+    step 6: DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET)
+    step 7: UPLOAD wLength 128 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger
+
+  ORDER: stage (no trigger) -> read the staged bytes back -> compare -> re-stage -> trigger.
+  If the comparison fails, NOTHING IS EXECUTED (exit 9). That is the whole point: the
+  handler runs whatever the buffer holds the moment the 0xFFFF UPLOAD arrives.
+
+a9boot-host: LIVE_NO_SERIAL[status=TIMEOUT]: Operation timed out. Without a serial descriptor there is no PWND state to check, so there is no command channel.

@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : tools/arlo/ep0cut/target/release/ep0cut --mode cut
+exit_code     : 0
+wall_ms       : 1210
+capture_bytes : 8991
+capture_lines : 128
+capture_sha256: 1507d67dacb2a0f7529cf840ca00f5f74be58ca4a7fde3bae7cd167c18941ff9
+stdout        : a9pwn-traces/linux/e1-ep0cut-corrected.txt.stdout.txt

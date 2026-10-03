@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : bash -c cd <HOME>/Documents/iOS/arlo-ios-move && tools/arlo/ep0cut/target/release/ep0cut --mode sweep --shape pad,getdesc --lengths 0,64,1280 --repeats 3 --continue-after-timeout --json > a9pwn-traces/linux/stock-pad-1280.json 2> a9pwn-traces/linux/stock-pad-1280.table.txt
+exit_code     : 0
+wall_ms       : 1473
+capture_bytes : 7407
+capture_lines : 102
+capture_sha256: 4bd8814b23132ed3ce8b60ecd21ae467fe91fe54f7c905e1a083825c97dfe6e5
+stdout        : a9pwn-traces/linux/stock-pad-1280.txt.stdout.txt

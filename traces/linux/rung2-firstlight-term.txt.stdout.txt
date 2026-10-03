@@ -1,0 +1,18 @@
+# a9boot firstlight — 1 packet(s), 1 exchange(s)
+  [0] DNLOAD     72 bytes (1 transfer)  UPLOAD wLength   24  memc read 0x20c000038 len 0x8
+       purpose: AUSB_CFG0/CFG1 (PHY tunables the SecureROM programmed) (read-only; the only bytes written are inside the ROM's DFU buffer)
+       DNLOAD  636d656d636d656d000000000000000010003880010000003800000c0200000008000000000000000000000000000000000000000000000000000000000000000000000000000000
+  terminator: DFU_DNLOAD zero-length (the reference's shape; a runtime escalation, not the default)
+
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          DFU_GET_STATUS (read-only): status 0 (OK) state 5 (dfuDNLOAD-IDLE) [raw 0x00 32 00 00 0x05 0x00]
+note          DFU_GET_STATUS before the first exchange: status 0 (OK) state 5 (dfuDNLOAD-IDLE) [raw 0x00 32 00 00 0x05 0x00]
+WARNING       the DFU state is 5 (dfuDNLOAD-IDLE), not dfuIDLE. A DNLOAD that starts a *fresh* download is expected only in dfuIDLE; in any other state the ROM may append at an offset the host cannot see. If the first exchange fails, that is the first hypothesis to exclude, and a bus reset (`a9boot reset is Lead-only`) is the way back to dfuIDLE — not a retry.
+[0] memc read 0x20c000038 len 0x8: NO REPLY — LIVE_UPLOAD_FAILED (memc read 0x20c000038 len 0x8): Operation timed out. A timeout here usually means the handler did not run at all — check that the serial still contains PWND:[checkm8].
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 24, terminator: DFU_DNLOAD zero-length
+
+VERDICT       FAIL — [0] memc read 0x20c000038 len 0x8: NO REPLY — LIVE_UPLOAD_FAILED (memc read 0x20c000038 len 0x8): Operation timed out. A timeout here usually means the handler did not run at all — check that the serial still contains PWND:[checkm8].
+

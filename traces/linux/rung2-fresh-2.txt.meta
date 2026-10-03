@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host firstlight --live --sequence reference --read 0x20c000038:8 --read 0x20c000030:8 --json a9pwn-traces/linux/rung2-fresh-2.json
+exit_code     : 0
+wall_ms       : 104
+capture_bytes : 2398
+capture_lines : 34
+capture_sha256: 92f539cd35876c2d737d0b82321212c3457082204cadf23bc3c61e0c818ea817
+stdout        : a9pwn-traces/linux/rung2-fresh-2.txt.stdout.txt

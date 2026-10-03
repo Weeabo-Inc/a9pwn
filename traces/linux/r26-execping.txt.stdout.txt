@@ -1,0 +1,1 @@
+a9boot-host: the EXEC command is 11240 bytes but the assumed buffer capacity is 4096 — the command would overrun the buffer, which is corruption rather than a stall. That is U-2, still unmeasured: probe the capacity before executing anything.

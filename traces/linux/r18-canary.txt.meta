@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host firstlight --live --sequence reference --read 0x1800e0f08:32 --json a9pwn-traces/linux/r18-canary.json
+exit_code     : 0
+wall_ms       : 12
+capture_bytes : 1473
+capture_lines : 20
+capture_sha256: 2d3fb30fd7686ed6e4037ab715fd095f0252ea586ca74080c07ad00951b308bf
+stdout        : a9pwn-traces/linux/r18-canary.txt.stdout.txt

@@ -1,0 +1,26 @@
+usb_timeout: 5
+usb_abort_timeout_min: 0
+[libusb] Waiting for the USB handle with VID: 0x5AC, PID: 0x1227
+CPID: 0x8003
+Found the USB handle.
+Stage: RESET
+ret: true
+[libusb] Waiting for the USB handle with VID: 0x5AC, PID: 0x1227
+CPID: 0x8003
+Found the USB handle.
+Stage: SETUP
+ret: true
+[libusb] Waiting for the USB handle with VID: 0x5AC, PID: 0x1227
+CPID: 0x8003
+Found the USB handle.
+Stage: SPRAY
+ret: true
+[libusb] Waiting for the USB handle with VID: 0x5AC, PID: 0x1227
+CPID: 0x8003
+Found the USB handle.
+Stage: PATCH
+ret: true
+[libusb] Waiting for the USB handle with VID: 0x5AC, PID: 0x1227
+CPID: 0x8003
+Found the USB handle.
+Now you can boot untrusted images.
