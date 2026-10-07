@@ -1,0 +1,53 @@
+# a9boot probe — the unified post-pwn experiment (DRAM extent + AUSB tunables).
+# Run after the first PWND:[checkm8]. This build sends nothing; the packet list is
+# what a live run would send, and it is the same code path (`bundle::run_probe`).
+
+  0  # AUSB PHY tunables: a readback of live registers the SecureROM has already programmed, because that is how DFU is talking to us (LOADER-FILL.md §7).
+  1  DNLOAD   72 bytes  UPLOAD   24  memc read 0x20c000038 len 0x8
+  2  # DRAM walk: 128 MiB steps across the nominal 0x80000000 bytes. Over-declaring DRAM hands the kernel dead pages and corrupts rather than panicking (LOADER-FILL.md §2), so the extent is measured before it is declared.
+  3  DNLOAD  104 bytes  UPLOAD   16  memc 0x800000000 <- 0x180380048 len 0x20
+  3  DNLOAD   72 bytes  UPLOAD   48  memc read 0x800000000 len 0x20
+  4  DNLOAD  104 bytes  UPLOAD   16  memc 0x808000000 <- 0x180380048 len 0x20
+  4  DNLOAD   72 bytes  UPLOAD   48  memc read 0x808000000 len 0x20
+  5  DNLOAD  104 bytes  UPLOAD   16  memc 0x810000000 <- 0x180380048 len 0x20
+  5  DNLOAD   72 bytes  UPLOAD   48  memc read 0x810000000 len 0x20
+  6  DNLOAD  104 bytes  UPLOAD   16  memc 0x818000000 <- 0x180380048 len 0x20
+  6  DNLOAD   72 bytes  UPLOAD   48  memc read 0x818000000 len 0x20
+  7  DNLOAD  104 bytes  UPLOAD   16  memc 0x820000000 <- 0x180380048 len 0x20
+  7  DNLOAD   72 bytes  UPLOAD   48  memc read 0x820000000 len 0x20
+  8  DNLOAD  104 bytes  UPLOAD   16  memc 0x828000000 <- 0x180380048 len 0x20
+  8  DNLOAD   72 bytes  UPLOAD   48  memc read 0x828000000 len 0x20
+  9  DNLOAD  104 bytes  UPLOAD   16  memc 0x830000000 <- 0x180380048 len 0x20
+  9  DNLOAD   72 bytes  UPLOAD   48  memc read 0x830000000 len 0x20
+ 10  DNLOAD  104 bytes  UPLOAD   16  memc 0x838000000 <- 0x180380048 len 0x20
+ 10  DNLOAD   72 bytes  UPLOAD   48  memc read 0x838000000 len 0x20
+ 11  DNLOAD  104 bytes  UPLOAD   16  memc 0x840000000 <- 0x180380048 len 0x20
+ 11  DNLOAD   72 bytes  UPLOAD   48  memc read 0x840000000 len 0x20
+ 12  DNLOAD  104 bytes  UPLOAD   16  memc 0x848000000 <- 0x180380048 len 0x20
+ 12  DNLOAD   72 bytes  UPLOAD   48  memc read 0x848000000 len 0x20
+ 13  DNLOAD  104 bytes  UPLOAD   16  memc 0x850000000 <- 0x180380048 len 0x20
+ 13  DNLOAD   72 bytes  UPLOAD   48  memc read 0x850000000 len 0x20
+ 14  DNLOAD  104 bytes  UPLOAD   16  memc 0x858000000 <- 0x180380048 len 0x20
+ 14  DNLOAD   72 bytes  UPLOAD   48  memc read 0x858000000 len 0x20
+ 15  DNLOAD  104 bytes  UPLOAD   16  memc 0x860000000 <- 0x180380048 len 0x20
+ 15  DNLOAD   72 bytes  UPLOAD   48  memc read 0x860000000 len 0x20
+ 16  DNLOAD  104 bytes  UPLOAD   16  memc 0x868000000 <- 0x180380048 len 0x20
+ 16  DNLOAD   72 bytes  UPLOAD   48  memc read 0x868000000 len 0x20
+ 17  DNLOAD  104 bytes  UPLOAD   16  memc 0x870000000 <- 0x180380048 len 0x20
+ 17  DNLOAD   72 bytes  UPLOAD   48  memc read 0x870000000 len 0x20
+ 18  DNLOAD  104 bytes  UPLOAD   16  memc 0x878000000 <- 0x180380048 len 0x20
+ 18  DNLOAD   72 bytes  UPLOAD   48  memc read 0x878000000 len 0x20
+ 19  DNLOAD  104 bytes  UPLOAD   16  memc 0x87fffffe0 <- 0x180380048 len 0x20
+ 19  DNLOAD   72 bytes  UPLOAD   48  memc read 0x87fffffe0 len 0x20
+
+35 packets, 3064 DNLOAD bytes, 17 addresses walked.
+
+## what the result decides
+  * AUSB cfg0/cfg1 non-zero and stable -> `apple,cfg0-device`/`cfg1-device` for the
+    ausbphy0 node, which is what unblocks the USB gadget console (ttyGS0).
+  * last address that round-trips -> the DRAM extent. Declaring MORE than exists
+    corrupts rather than panics (LOADER-FILL.md §2), so this is measured, not assumed.
+  * a failure at the first address means the ROM's EL3 translation does not reach DRAM
+    at all, which is PLAN B in DESIGN.md §11.1 and stops the design.
+
+no device was opened, and this build cannot open one.

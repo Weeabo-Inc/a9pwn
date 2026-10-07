@@ -1,0 +1,4 @@
+  probe       : seq=3      CANCELLED bm=0x80 b=0x06 wV=0x0303 wI=0x0409 wL=255   xfer=0/255      8102us rc=3 abort=8ms
+  transferred : 0 of 255 (libusb's own number)
+  status      : Cancelled  libusb_rc=3
+  => NO PARTIAL: libusb reports 0 for a cancelled transfer, so abort_xfer=0 cannot tell us what the device took.

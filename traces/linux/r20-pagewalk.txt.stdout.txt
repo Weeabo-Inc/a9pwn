@@ -1,0 +1,57 @@
+# a9boot pagewalk — may I touch this address? (read-only; touches no lookup address)
+  root       0x1800c8000 (ROM TTBR0_EL3 tables, INSPECTED gaster.c:627-631)
+  canary     yes: the handler's own bytes must match first
+  find-root  no: --root is used as given
+  control    0x1800e0f08 (MEASURED mapped; the run FAILS if this does not walk to MAPPED)
+  control    0x180380110 (MEASURED mapped; the run FAILS if this does not walk to MAPPED)
+  lookup     0x1800e0f08
+  lookup     0x180380110
+  lookup     0x800000000
+  lookup     0x20e80110
+  512 entries x 8 bytes per level, read through `memc read`; a table pointer outside
+  known-mapped SRAM is REFUSED by name rather than followed.
+
+0x0001800e0f08  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+0x000180380110  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+0x0001800e0f08  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+0x000180380110  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+0x000800000000  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+0x000020e80110  UNMAPPED  UNMAPPED: the walk stopped at level 0 on an invalid descriptor (0x0000000000000000). DO NOT TOUCH THIS ADDRESS: this is the read that cost a device (RUNG2-EVIDENCE.md §3).
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          CANARY OK: the resident handler reads back as the 248-byte reference build
+note          NO_POSITIVE_CONTROL: a known-mapped address (the resident handler or the DFU staging address) did not walk to MAPPED, so this walk cannot say 'yes' anywhere and its 'no' answers mean nothing. Every UNMAPPED above is UNINTERPRETABLE — the root is wrong, not the mapping.
+WARNING       NO_POSITIVE_CONTROL: a known-mapped address (the resident handler or the DFU staging address) did not walk to MAPPED, so this walk cannot say 'yes' anywhere and its 'no' answers mean nothing. Every UNMAPPED above is UNINTERPRETABLE — the root is wrong, not the mapping.
+[0] memc read 0x1800e0f08 len 0x20: status OK, actual_length 48/48, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 32 reply bytes, 843 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 48, sequence reference
+[1] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1342 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[2] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1417 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[3] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1251 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[4] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1222 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[5] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1436 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[6] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1321 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[7] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1369 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[8] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1483 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[9] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1448 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[10] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1469 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[11] memc read 0x1800c8000 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1270 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[12] memc read 0x1800c8800 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1380 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+
+VERDICT       FAIL — no positive control: the walk mapped nothing it knows to be mapped
+
+evidence written to a9pwn-traces/linux/r20-pagewalk.json (schema a9boot.evidence/1)
+a9boot-host: no positive control

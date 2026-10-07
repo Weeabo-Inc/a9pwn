@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : ./a9pwn/target/release/a9pwn ident
+exit_code     : 0
+wall_ms       : 11
+capture_bytes : 374
+capture_lines : 4
+capture_sha256: f531814717410e5d3c238ac987d1f5fde8907065d3deaca12c6852fdf0e7e0f8
+stdout        : a9pwn-traces/linux/e0-ident.txt.stdout.txt

@@ -1,0 +1,6 @@
+{"seq":1,"stage":"SETUP","kind":"single_stage_start","t_micros":70,"detail":"precondition=RESET + bus reset usb_timeout=5ms leak_windex=0xA"}
+{"seq":2,"stage":"RESET","kind":"reset_begin","t_micros":65020,"detail":"DFU state machine -> MANIFEST_WAIT_RESET"}
+{"seq":3,"stage":"RESET","kind":"xfer","t_micros":69050,"label":"reset_dnload_suffix","status":"STALL","bm_request_type":33,"b_request":1,"w_value":0,"w_index":0,"w_length":16,"transferred":0,"requested":16,"xfer_micros":4019,"libusb_rc":-9,"xfer_seq":3}
+{"seq":4,"stage":"RESET","kind":"xfer","t_micros":71407,"label":"reset_clr_status_recovery","status":"OK","bm_request_type":33,"b_request":4,"w_value":0,"w_index":0,"w_length":0,"transferred":0,"requested":0,"xfer_micros":2333,"libusb_rc":0,"xfer_seq":4}
+{"seq":5,"stage":"RESET","kind":"precondition_failed","t_micros":71413,"detail":"code=RESET_SUFFIX_NOT_ACCEPTED detail=the 16-byte DNLOAD returned STALL with 0 bytes (gaster.c:840)"}
+{"seq":6,"stage":"SETUP","kind":"run_end","t_micros":72244,"detail":"Aborted(\"the RESET precondition for stage SETUP failed [RESET_SUFFIX_NOT_ACCEPTED]: the 16-byte DNLOAD returned STALL with 0 bytes (gaster.c:840). gaster only reaches SETUP after RESET returned true and a bus reset completed (gaster.c:1245-1268); running it now would produce an artefact, not a measurement.\")"}

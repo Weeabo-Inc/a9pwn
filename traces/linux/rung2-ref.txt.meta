@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/release/a9boot-host firstlight --live --sequence reference
+exit_code     : 5
+wall_ms       : 1071
+capture_bytes : 1399
+capture_lines : 20
+capture_sha256: 290cc15fd5df03cfd8f187b5703b208257a3742fe0600922d3c6e83c7fb1f847
+stdout        : a9pwn-traces/linux/rung2-ref.txt.stdout.txt

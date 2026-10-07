@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/release/a9boot-host firstlight --live --terminator dfu
+exit_code     : 5
+wall_ms       : 1081
+capture_bytes : 859
+capture_lines : 12
+capture_sha256: e0d8ce3f4f3fd334651a1bac3d50871a437fd8b3e48f8368cc9f0ac2e7ab4c6b
+stdout        : a9pwn-traces/linux/rung2-firstlight-term.txt.stdout.txt

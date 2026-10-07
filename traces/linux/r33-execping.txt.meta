@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host exec --live --cmd PING --payload a9boot/target/aarch64-unknown-none-softfloat/payload/a9boot-payload --capacity 11240 --json a9pwn-traces/linux/r33-execping.json
+exit_code     : 9
+wall_ms       : 27
+capture_bytes : 3286
+capture_lines : 42
+capture_sha256: cb2885347d5c903d4bb756d4e59d2112341fd06e2c6826c21bd839d565aa699e
+stdout        : a9pwn-traces/linux/r33-execping.txt.stdout.txt

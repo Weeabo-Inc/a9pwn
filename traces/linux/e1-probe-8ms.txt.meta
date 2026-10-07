@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : ./a9pwn/target/release/a9pwn probe-partial-count --deadline-ms 8
+exit_code     : 0
+wall_ms       : 217
+capture_bytes : 342
+capture_lines : 6
+capture_sha256: c819ba92814df060bb8b36cb092e021387033db2abab9ebae2d0e940428bb427
+stdout        : a9pwn-traces/linux/e1-probe-8ms.txt.stdout.txt

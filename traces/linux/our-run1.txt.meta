@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : ./a9pwn-traces/linux/bin/a9pwn-93a93aed run --rounds 12 --setup-budget 300 --pad-timeout-ms 5 --allow-winusb --trace a9pwn-traces/linux/our-run1.jsonl
+exit_code     : 0
+wall_ms       : 1507
+capture_bytes : 17277
+capture_lines : 244
+capture_sha256: 366e5c632c095c1cbface494a77d77015e56383e66208b5420b52f79972b27cc
+stdout        : a9pwn-traces/linux/our-run1.txt.stdout.txt

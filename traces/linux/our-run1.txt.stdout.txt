@@ -1,0 +1,38 @@
+  RESET: WARNING - the post-stage bus reset (after the RESET attempt) was issued but did not prove itself: evidence "driver cannot reset", when=post-stage after=RESET evidence="driver cannot reset" rc=0 capability="unknown" interface_claimed=true DFU state 5 (dfuDNLOAD-IDLE) -> 5 (dfuDNLOAD-IDLE) micros=236562 libusb_reset_device returned SUCCESS after 236562 us; driver service '(unmeasured)'; DFU state 5 (dfuDNLOAD-IDLE) -> 5 (dfuDNLOAD-IDLE). Driver service '(unmeasured)' is neither libusbK, libusb0 nor WinUSB, so whether libusb issued a real device reset cannot be determined from here. Treat this as NOT a proven bus reset.. Not success, not failure — continuing. gaster discards this result and resets unconditionally after every attempt (gaster.c:197-200, :1268), so the run continues rather than stopping the experiment on a failed reading. If the run fails later, read this line and the reset_unverified events before blaming the exploit.
+  SETUP: attempt=1 abort_window_ms=4 sweep=ok abort_status=OK abort_xfer=2048/2048 abort_micros=946 note="transfer completed inside the window" pad_req=none (delivered >= overwrite_pad 0x500) after_abort_status=OK after_abort_rc=0
+  SETUP: attempt=2 abort_window_ms=5 sweep=ok abort_status=OK abort_xfer=2048/2048 abort_micros=981 note="transfer completed inside the window" pad_req=none (delivered >= overwrite_pad 0x500) after_abort_status=OK after_abort_rc=0
+  SETUP: attempt=3 abort_window_ms=0 sweep=ok abort_status=CANCELLED abort_xfer=0 (host reported nothing)/2048 abort_micros=87 note="cancelled at the requested window" pad_req=1280 after_abort_status=CANCELLED after_abort_xfer=0/2048 after_abort_rc=3 pad_status=STALL pad_xfer=0/1280 pad_deadline_ms=5 pad_micros=745 (requested vs effective; usb_timeout=5ms defines the abort sweep, not this)
+  SETUP: PASSED - pad STALL after 3 attempts. attempts=3 distinct_abort_windows=3 [4ms,5ms,0ms] span=6 pad_sent=1 pad_stall=1 pad_ok=0 pad_timeout=0 pad_other=0 short_aborts=1 zero_aborts=1 incomplete_aborts=0 last_window_micros=87 (usb_timeout=5ms abort_min=0ms pad_deadline_ms=5ms overwrite_pad=0x500)
+  RESET: WARNING - the post-stage bus reset (after the SETUP attempt) was issued but did not prove itself: evidence "driver cannot reset", when=post-stage after=SETUP evidence="driver cannot reset" rc=0 capability="unknown" interface_claimed=true DFU state 5 (dfuDNLOAD-IDLE) -> 5 (dfuDNLOAD-IDLE) micros=235440 libusb_reset_device returned SUCCESS after 235440 us; driver service '(unmeasured)'; DFU state 5 (dfuDNLOAD-IDLE) -> 5 (dfuDNLOAD-IDLE). Driver service '(unmeasured)' is neither libusbK, libusb0 nor WinUSB, so whether libusb issued a real device reset cannot be determined from here. Treat this as NOT a proven bus reset.. Not success, not failure — continuing. gaster discards this result and resets unconditionally after every attempt (gaster.c:197-200, :1268), so the run continues rather than stopping the experiment on a failed reading. If the run fails later, read this line and the reset_unverified events before blaming the exploit.
+  SPRAY: leak_wValue=0x0304 = (3<<8)|ident_index 0x04; leak/no-leak wIndex=0xA; lengths leak=0x40 no_leak=0xC1 clr_status=0xC1; ident_index is the string-descriptor index cached at open (gaster.c:866 uses device_descriptor.i_serial_number; no GET_DESCRIPTOR is issued inside the loop — usb.rs:472)
+  SPRAY: iteration=1 stall_status=STALL stall_micros=166 leak_status=CANCELLED leak_xfer=0 leak_micros=1074 no_leak_status=CANCELLED no_leak_xfer=0 no_leak_micros=1142
+  PATCH: WARNING - [PATCH_UPLOAD_SHORT] payload chunk 0 (528 bytes at offset 0) returned TIMEOUT with 0 bytes sent. PATCH_UPLOAD_SHORT: the payload in the bootrom may be incomplete, and the PWND marker after the reset is the only proof either way.
+  PATCH: warning - the MANIFEST state walk after the upload did not complete cleanly; gaster does not check it (gaster.c:1220-1222). A TIMEOUT here after a successful upload is consistent with the payload having landed and the machine having left its DFU request loop — it is not evidence that the upload failed, and not proof that it succeeded. Waiting for the PWND marker after the reset.
+  PWND marker present: Some("checkm8") — checkm8 landed.
+
+  tracer summary (stages):
+      trace summary (exact counts; nothing sampled or estimated)
+        sink           : a9pwn-traces/linux/our-run1.jsonl (63 JSONL line(s) written)
+        transfers      : transfers=23 ok=10 stall=3 timeout=6 cancelled=3 nodevice=0 error=1 resets_attempted=4 resets_real=0 resets_refuted=0 resets_unverified=0 resets_pipe_cycle=2
+        per stage      : PATCH/STALL=1 PATCH/TIMEOUT=6 RESET/OK=6 SETUP/CANCELLED=1 SETUP/OK=4 SETUP/STALL=1 SPRAY/CANCELLED=2 SPRAY/ERROR=1 SPRAY/STALL=1
+        setup          : attempts=3 pad_requests=1 pad_stalls=1 pad_timeouts=0 pad_errors=0
+                         abort_windows=[4, 5, 0] unwindowed_attempts=0
+                         pad_sizes=[1280] abort_completed_full=2 abort_timeouts=0 abort_cancelled_early=0
+        spray          : stall_requests=1 stall_not_stalling=0 leak_requests=2 leak_not_zero=0
+        resets         : attempted=4 real=0 refuted=0 unverified=0 pipe_cycle=2 unrecorded=2
+        rounds         : 4
+        discovery      : recorded=false nodes=[] path_len=none open_errno=none open_error=none
+        predicate fails: PATCH_UPLOAD_SHORT=1 bus_reset_delivered=2
+
+  PWND marker is present in the serial descriptor.
+
+  VERDICT  The bound driver cannot reset the port, so checkm8 can never fire. This is the failure that looks like an exploit bug and is not one.  [NO_RESET_CAPABILITY]
+    evidence: usb: driver_class=unknown reset_capability=unknown — the reset is the measurement that decides this verdict
+    evidence: trace: transfers=23 ok=10 stall=3 timeout=6 cancelled=3 nodevice=0 error=1 resets_attempted=4 resets_real=0 resets_refuted=0 resets_unverified=0 resets_pipe_cycle=2 (Counters, exact)
+    evidence: trace: resets_attempted=4 resets_real=0 resets_refuted=0 resets_unverified=0 resets_pipe_cycle=2 (Counters.resets_*, from Tracer::reset; pipe_cycle = the driver cannot reset, unverified = the effect was observable neither way)
+    evidence: trace: setup attempts=3 pad_requests=1 pad_stalls=1 pad_timeouts=0 pad_errors=0 abort_completed_full=2 abort_cancelled_early=0 unreported_windows=0 (Counters.setup_*)
+    evidence: reference: libusb1-sys-0.7.0/libusb/libusb/os/windows_winusb.c:3380-3420: winusbx_reset_device cycles pipes and only calls ResetDevice when sub_api != WinUSB, then returns LIBUSB_SUCCESS either way — the caller cannot tell the two apart
+    evidence: reference: gaster.c:1268 resets after every stage attempt, successful or not; a pipe cycle does not re-arm the bootrom's DFU state, and after PATCH the overwritten dfu_handle_bus_reset callback can never fire
+    evidence: device: PID=0x1227 CPID=0x8003 CPRV=0x01 BDID=0x02 SRTG=[iBoot-2234.0.0.2.22] PWND=checkm8 serial_len=113 (USB serial descriptor)
+    next    : Run `a9drv bind --pid 1227` from an ELEVATED prompt to rebind USB\VID_05AC&PID_1227 to libusbK, then run `a9pwn preflight` and require it to print `reset: real bus reset`. Only then `a9pwn run`. (Fallback: zadig-2.9.exe -> Options -> List All Devices -> 05AC:1227 -> libusbK -> Install Driver.)
+    confidence: High

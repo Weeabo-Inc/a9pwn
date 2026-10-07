@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : ./a9pwn/target/release/a9pwn selftest
+exit_code     : 0
+wall_ms       : 3
+capture_bytes : 0
+capture_lines : 0
+capture_sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+stdout        : a9pwn-traces/linux/neg-selftest.txt.stdout.txt

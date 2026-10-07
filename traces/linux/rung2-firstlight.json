@@ -1,0 +1,79 @@
+{
+  "schema": "a9boot.evidence/1",
+  "tool": "a9boot-host",
+  "tool_version": "0.1.0",
+  "command": "a9boot-host firstlight --live --json a9pwn-traces/linux/rung2-firstlight.json",
+  "mode": "live",
+  "build": {
+    "usb_feature": true,
+    "dnload_chunk": 2048,
+    "reply_off": 16,
+    "payload_off": 272
+  },
+  "started_utc": "2026-10-03T13:02:42Z",
+  "finished_utc": "2026-10-03T13:02:43Z",
+  "wall_clock_ms": 1005,
+  "transport": "LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.",
+  "device": {
+    "identity_checked": true,
+    "identity": "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]",
+    "identity_error": null,
+    "serial": "REDACTED (never published)"
+  },
+  "exchanges": [
+    {
+      "index": 0,
+      "label": "memc read 0x20c000038 len 0x8",
+      "purpose": "AUSB_CFG0/CFG1 (PHY tunables the SecureROM programmed) (read-only; the only bytes written are inside the ROM's DFU buffer)",
+      "request": {
+        "bmRequestType": "0x21",
+        "bRequest": "0x01 (DFU_DNLOAD)",
+        "wValue": "0x0000",
+        "wIndex": "0x0000",
+        "dnload_len": 72,
+        "dnload_transfers": 1,
+        "dnload_hex": "636d656d636d656d000000000000000010003880010000003800000c0200000008000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "dnload_sha256": "38e040c167a7b744bbd1cb4c8508170107c156330179cdf26bd3d72c435961fa",
+        "term_dnload": "none"
+      },
+      "trigger": {
+        "bmRequestType": "0xa1",
+        "bRequest": "0x02 (DFU_UPLOAD)",
+        "wValue": "0xffff",
+        "wIndex": "0x0000",
+        "wLength": 24
+      },
+      "start_us": 207,
+      "duration_us": 1005726,
+      "response": null,
+      "transport_error": "LIVE_UPLOAD_FAILED (memc read 0x20c000038 len 0x8): Operation timed out. A timeout here usually means the handler did not run at all — check that the serial still contains PWND:[checkm8].",
+      "parse": {
+        "state": "UNREAD",
+        "reason": "LIVE_UPLOAD_FAILED (memc read 0x20c000038 len 0x8): Operation timed out. A timeout here usually means the handler did not run at all — check that the serial still contains PWND:[checkm8].",
+        "magic_hex": "UNREAD",
+        "magic_ascii": "UNREAD",
+        "retval_hex": "UNREAD",
+        "retval_label": "UNREAD",
+        "data_len": "UNREAD",
+        "data_hex": "UNREAD"
+      },
+      "verdict": "FAIL"
+    }
+  ],
+  "notes": [
+    "identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present",
+    "DFU_GET_STATUS (read-only): status 0 (OK) state 2 (dfuIDLE) [raw 0x00 32 00 00 0x02 0x00]",
+    "DFU_GET_STATUS before the first exchange: status 0 (OK) state 2 (dfuIDLE) [raw 0x00 32 00 00 0x02 0x00]"
+  ],
+  "warnings": [],
+  "dfu_status_before": {"status": 0, "state": 2, "state_name": "dfuIDLE", "accepts_a_fresh_dnload": true},
+  "not_proved_by_this_run": [
+    "the channel bindings (bmRequestType/bRequest/wValue/magic offsets) are INSPECTED from research/refs/gaster/payload_handle_checkm8_request.S, not MEASURED on this device: UNVERIFIED-BY-TEST until an exchange parses",
+    "that DONE_MAGIC in a reply proves OUR handler ran rather than the ROM echoing a buffer that happened to begin with it",
+    "that the ROM's DNLOAD write offset resets between commands (tested only by two exchanges in one session, which is what --repeat 2 does)",
+    "anything about DRAM: extent, reachability from EL3, or usability (that is the DRAM walk, a separate step)",
+    "that the a9boot payload can be executed at abi::payload_exec_addr() (EXEC is a separate step and UNVERIFIED-BY-TEST)"
+  ],
+  "verdict": "FAIL",
+  "verdict_reason": "[0] memc read 0x20c000038 len 0x8: NO REPLY — LIVE_UPLOAD_FAILED (memc read 0x20c000038 len 0x8): Operation timed out. A timeout here usually means the handler did not run at all — check that the serial still contains PWND:[checkm8]."
+}

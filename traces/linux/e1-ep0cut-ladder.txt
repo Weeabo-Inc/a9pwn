@@ -1,0 +1,24 @@
+ep0cut — GET_DESCRIPTOR(3,4) wLength=255 on 05ac:1227
+          ladder (us): [0, 25, 50, 75, 100, 125, 150, 300, 2000]   reset-between: true
+
+     asked   achieved  status     libusb sz  head
+       0us      134us  CANCELLED      64/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+      25us      167us  CANCELLED       0/255  
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+      50us      163us  CANCELLED      64/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+      75us      180us  CANCELLED     128/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+     100us      247us  CANCELLED     192/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+     125us      161us  CANCELLED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+            (port reset after the cancel: rc=0; this is the measured recovery for the EP0 wedge a cancel causes)
+     150us      147us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+     300us      188us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+    2000us      176us  COMPLETED     198/255  c6 03 43 00 50 00 49 00 44 00 3a 00 38 00 30 00 30 00 33 00 20 00 43 00 50 00 52 00 56 00 3a 00
+
+  control 1 (deadline 0us): FAILED — expected CANCELLED/0, got CANCELLED/64 — the cancelled state is NOT being produced, so no other row means anything
+  control 2 (deadline 2000us): OK — the device answers this request when it is not cut (198 bytes of the 255 asked — a string descriptor is legitimately shorter)
+
+  VERDICT  INVALID LADDER — fix the controls before reading anything below.

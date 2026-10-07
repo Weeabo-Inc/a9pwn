@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host capacity --live --json a9pwn-traces/linux/r18-capacity.json
+exit_code     : 7
+wall_ms       : 104
+capture_bytes : 4134
+capture_lines : 54
+capture_sha256: 3375dfc9f07f303f9b978b231fb54155b807cd2f0f26b58972cccee4219d4a8a
+stdout        : a9pwn-traces/linux/r18-capacity.txt.stdout.txt

@@ -1,0 +1,12 @@
+a9pwn ident
+
+  serial        : CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22]
+  CPID          : 0x8003
+  CPRV / BDID   : 0x01 / 0x02
+  SRTG          : iBoot-2234.0.0.2.22
+  ECID          : ...<redacted> (masked)
+  A9 target     : yes
+  driver service: unknown
+  reset         : unknown
+  PWND marker   : absent
+  usb speed     : high (480 Mbit/s) (negotiated, measured at open)

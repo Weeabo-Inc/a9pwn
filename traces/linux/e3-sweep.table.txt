@@ -1,0 +1,29 @@
+ep0cut --mode sweep — wLength x latency on 05ac:1227
+  index: declared iSerialNumber 4 from the host-cached device descriptor (a pwn moves the marker to a different index; a hardcoded index is how a tool reports the wrong string)
+  shapes: ["pad", "overflow", "getdesc"]
+  lengths: [0, 16, 48, 64, 128, 256, 512, 1024, 1280, 2048]  repeats: 3  rows: 90
+  per-row deadline: 250 ms (libusb's timeout). THIS TOOL NEVER CANCELS; a TIMED_OUT row stops the ladder. reset-between: true
+  OUT data pattern: Zeros
+  NOTE: this sends the exploit's own request shapes. It is a measurement tool, not a pwn.
+
+  round shape     wLength  status        sz         us
+      0 pad             0  STALL          0        242
+      0 pad            16  STALL          0        202
+      0 pad            48  STALL          0        192
+      0 pad            64  STALL          0        187
+      0 pad           128  TIMED_OUT     64     250291
+            (row ended TIMED_OUT; libusb's timeout cancels the URB internally — this is the EP0 wedge risk)
+            (port reset: rc=0; the measured recovery)
+
+  SWEEP STOPPED after a TIMED_OUT row. The partial ladder is printed below but it is
+  NOT a valid slope: the rows after the stop were never taken. Re-run with
+  --continue-after-timeout only if you accept that.
+
+  ---- per point (median of N repeats) ----
+  shape     wLength  N   median_us    min_us    max_us  spread     sz  statuses
+  pad             0  1         242       242       242       0      0  STALLx1
+  pad            16  1         202       202       202       0      0  STALLx1
+  pad            48  1         192       192       192       0      0  STALLx1
+  pad            64  1         187       187       187       0      0  STALLx1
+  pad           128  1      250291    250291    250291       0     64  TIMED_OUTx1
+

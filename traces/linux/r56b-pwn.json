@@ -1,0 +1,3 @@
+{"seq":1,"stage":"-","kind":"run_start","t_micros":11,"detail":"rounds=12 usb_timeout=5ms abort_min=0ms leak_windex=0xA setup_budget=300attempts/600000ms settle_ms=0 stop_after_setup_stall=false allow_winusb=false"}
+{"seq":2,"stage":"-","kind":"no_device","t_micros":3001123,"detail":"no DFU device after 3001 ms of wall-clock waiting (427 open attempt(s), budget 3s): no Apple device among the 6 USB device(s) libusb enumerated (VID 05AC); enumeration itself worked, the device is absent"}
+{"seq":3,"stage":"-","kind":"run_end","t_micros":3001128,"detail":"NoDevice"}

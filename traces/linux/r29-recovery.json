@@ -1,0 +1,3 @@
+{"seq":1,"stage":"-","kind":"run_start","t_micros":16,"detail":"rounds=12 usb_timeout=5ms abort_min=0ms leak_windex=0xA setup_budget=300attempts/600000ms settle_ms=0 stop_after_setup_stall=false allow_winusb=false"}
+{"seq":2,"stage":"-","kind":"unsupported","t_micros":606269,"detail":"the serial descriptor carries no CPID, so the die cannot be identified. serial: \"\""}
+{"seq":3,"stage":"-","kind":"run_end","t_micros":606428,"detail":"Unsupported(\"the serial descriptor carries no CPID, so the die cannot be identified. serial: \\\"\\\"\")"}

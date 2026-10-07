@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : env A9BOOT_LIVE_CONFIRMED=yes ./a9boot/target/usb/release/a9boot-host exec --live --cmd DESCRIBE --payload a9boot/target/aarch64-unknown-none-softfloat/payload/a9boot-payload --capacity 11240 --json a9pwn-traces/linux/r39-describe.json
+exit_code     : 5
+wall_ms       : 1045
+capture_bytes : 12258
+capture_lines : 158
+capture_sha256: 0545a9c15de54808bb93709aa54ede9b83114eea82f89e7165f2c1f5a6ab87f5
+stdout        : a9pwn-traces/linux/r39-describe.txt.stdout.txt

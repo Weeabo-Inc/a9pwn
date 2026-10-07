@@ -1,0 +1,32 @@
+{"tool":"ep0cut","mode":"sweep","incomplete":false,
+  "rows":[
+  {"round":0,"shape":"pad","length":0,"status":"STALL","sz":0,"elapsed_us":154},
+  {"round":0,"shape":"pad","length":64,"status":"STALL","sz":0,"elapsed_us":177},
+  {"round":0,"shape":"pad","length":1280,"status":"TIMED_OUT","sz":64,"elapsed_us":250084},
+  {"round":0,"shape":"getdesc","length":0,"status":"COMPLETED","sz":0,"elapsed_us":51},
+  {"round":0,"shape":"getdesc","length":64,"status":"COMPLETED","sz":64,"elapsed_us":51},
+  {"round":0,"shape":"getdesc","length":1280,"status":"COMPLETED","sz":198,"elapsed_us":132},
+  {"round":1,"shape":"pad","length":0,"status":"STALL","sz":0,"elapsed_us":158},
+  {"round":1,"shape":"pad","length":64,"status":"STALL","sz":0,"elapsed_us":172},
+  {"round":1,"shape":"pad","length":1280,"status":"TIMED_OUT","sz":64,"elapsed_us":250113},
+  {"round":1,"shape":"getdesc","length":0,"status":"COMPLETED","sz":0,"elapsed_us":68},
+  {"round":1,"shape":"getdesc","length":64,"status":"COMPLETED","sz":64,"elapsed_us":73},
+  {"round":1,"shape":"getdesc","length":1280,"status":"COMPLETED","sz":198,"elapsed_us":174},
+  {"round":2,"shape":"pad","length":0,"status":"STALL","sz":0,"elapsed_us":169},
+  {"round":2,"shape":"pad","length":64,"status":"STALL","sz":0,"elapsed_us":174},
+  {"round":2,"shape":"pad","length":1280,"status":"TIMED_OUT","sz":64,"elapsed_us":250151},
+  {"round":2,"shape":"getdesc","length":0,"status":"COMPLETED","sz":0,"elapsed_us":78},
+  {"round":2,"shape":"getdesc","length":64,"status":"COMPLETED","sz":64,"elapsed_us":82},
+  {"round":2,"shape":"getdesc","length":1280,"status":"COMPLETED","sz":198,"elapsed_us":154}
+  ],
+  "points":[
+    {"shape":"pad","length":0,"n":3,"median_us":158,"min_us":154,"max_us":169,"median_sz":0,"statuses":[{"status":"STALL","n":3}]},
+    {"shape":"pad","length":64,"n":3,"median_us":174,"min_us":172,"max_us":177,"median_sz":0,"statuses":[{"status":"STALL","n":3}]},
+    {"shape":"pad","length":1280,"n":3,"median_us":250113,"min_us":250084,"max_us":250151,"median_sz":64,"statuses":[{"status":"TIMED_OUT","n":3}]},
+    {"shape":"getdesc","length":0,"n":3,"median_us":68,"min_us":51,"max_us":78,"median_sz":0,"statuses":[{"status":"COMPLETED","n":3}]},
+    {"shape":"getdesc","length":64,"n":3,"median_us":73,"min_us":51,"max_us":82,"median_sz":64,"statuses":[{"status":"COMPLETED","n":3}]},
+    {"shape":"getdesc","length":1280,"n":3,"median_us":154,"min_us":132,"max_us":174,"median_sz":198,"statuses":[{"status":"COMPLETED","n":3}]}
+  ],
+  "noise_us":67,
+  "controls":["  C1 OK — GET_DESCRIPTOR answered with up to 198 bytes in 2 points","  C2 WEAK — only 1 GET_DESCRIPTOR point(s) returned the full 198-byte answer; two asked lengths are needed to test host drift","  C3 baseline (wLength 0): pad=158 us (STALLx3), getdesc=68 us (COMPLETEDx3)"],
+  "verdict":"pad (bm=00 b=00 wValue=0 wIndex=0 (pad, gaster.c:853)) — DATA CONSUMPTION (a) SUPPORTED"}

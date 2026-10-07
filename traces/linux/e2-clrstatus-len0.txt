@@ -1,0 +1,14 @@
+a9pwn probe-clrstatus — a BARE DFU_CLRSTATUS, nothing else
+
+  device        : bus 1 addr 10  CPID=0x8003  PWND=PRESENT
+  serial        : 113 chars -> 228 descriptor bytes (MEASURED: stock 98 chars / 198 B; pwned 113 chars / 228 B)
+  DFU state pre : manifest (0x07)  [read OK, 6 bytes, 169 us]
+  request       : bm=0x21 b=DFU_CLRSTATUS(4) wValue=0 wIndex=0 wLength=0
+  sent          : OK  transferred=0/0  libusb_rc=0  102 us
+  DFU state post: UNREAD — ERROR (libusb_rc=-1) after 503 us. An unread state is not a state: this is what a device that has left the bus looks like
+  presence      : LEFT the bus and came back after 359 ms at addr 11 (a NEW address — re-enumeration)
+  PWND after    : still present
+
+  what this means:
+    A drop here is a property of the BOOTROM's CLR_STATUS handling, not of the exploit: nothing else was sent. gaster issues this same request at `gaster.c:843` and `gaster.c:910`, so a drop is either survivable reference behaviour or something gaster's own `wait_usb_handle` (`gaster.c:202-218`) absorbs. Do not conclude the device is bricked, and do not conclude our stage code caused it.
+    state pre=manifest post=unread

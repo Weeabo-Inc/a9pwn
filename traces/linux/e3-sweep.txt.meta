@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : bash -c cd <HOME>/Documents/iOS/arlo-ios-move && timeout 600 tools/arlo/ep0cut/target/release/ep0cut --mode sweep --json > a9pwn-traces/linux/e3-sweep.json 2> a9pwn-traces/linux/e3-sweep.table.txt
+exit_code     : 1
+wall_ms       : 571
+capture_bytes : 2316
+capture_lines : 32
+capture_sha256: 6845b5c9cfe4c39974f3e9f0117320dded3bd950779156ba631e38d619f3805a
+stdout        : a9pwn-traces/linux/e3-sweep.txt.stdout.txt

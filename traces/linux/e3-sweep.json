@@ -1,0 +1,18 @@
+{"tool":"ep0cut","mode":"sweep","incomplete":true,
+  "rows":[
+  {"round":0,"shape":"pad","length":0,"status":"STALL","sz":0,"elapsed_us":242},
+  {"round":0,"shape":"pad","length":16,"status":"STALL","sz":0,"elapsed_us":202},
+  {"round":0,"shape":"pad","length":48,"status":"STALL","sz":0,"elapsed_us":192},
+  {"round":0,"shape":"pad","length":64,"status":"STALL","sz":0,"elapsed_us":187},
+  {"round":0,"shape":"pad","length":128,"status":"TIMED_OUT","sz":64,"elapsed_us":250291}
+  ],
+  "points":[
+    {"shape":"pad","length":0,"n":1,"median_us":242,"min_us":242,"max_us":242,"median_sz":0,"statuses":[{"status":"STALL","n":1}]},
+    {"shape":"pad","length":16,"n":1,"median_us":202,"min_us":202,"max_us":202,"median_sz":0,"statuses":[{"status":"STALL","n":1}]},
+    {"shape":"pad","length":48,"n":1,"median_us":192,"min_us":192,"max_us":192,"median_sz":0,"statuses":[{"status":"STALL","n":1}]},
+    {"shape":"pad","length":64,"n":1,"median_us":187,"min_us":187,"max_us":187,"median_sz":0,"statuses":[{"status":"STALL","n":1}]},
+    {"shape":"pad","length":128,"n":1,"median_us":250291,"min_us":250291,"max_us":250291,"median_sz":64,"statuses":[{"status":"TIMED_OUT","n":1}]}
+  ],
+  "noise_us":0,
+  "controls":[],
+  "verdict":"INCOMPLETE: ladder stopped after a wedged row"}

@@ -1,0 +1,8 @@
+node          : /sys/kernel/debug/usb/usbmon/1u
+command       : timeout 90 ./a9lab/gaster-build/gaster pwn
+exit_code     : 0
+wall_ms       : 1422
+capture_bytes : 16354
+capture_lines : 236
+capture_sha256: d66021f45cf01d9a0ff9df02062fa5d114524aed7570dcbc6c7ec8e0914926fa
+stdout        : a9pwn-traces/linux/e4-gaster-1.txt.stdout.txt

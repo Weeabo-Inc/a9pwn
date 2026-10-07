@@ -1,0 +1,26 @@
+ep0cut --mode cut — GET_DESCRIPTOR(3,4) wLength=255 on 05ac:1227
+  index: declared iSerialNumber 4 from the host-cached device descriptor (a pwn moves the marker to a different index; a hardcoded index is how a tool reports the wrong string)
+  ladder (us): [0, 25, 50, 75, 100, 125, 150, 300, 2000]   reset-between: true
+  THIS MODE CANCELS BY DESIGN (that is what exposes a partial `actual_length`); a
+  cancel wedges EP0 on this bootrom. Use --mode sweep for a ladder that never cancels.
+
+     asked   achieved  status     libusb sz  head
+       0us     2133us  CANCELLED       0/255
+            (port reset after the cancel: rc=0; the measured recovery for the EP0 wedge)
+      25us      146us  CANCELLED       0/255
+            (port reset after the cancel: rc=0; the measured recovery for the EP0 wedge)
+      50us      196us  CANCELLED      64/255
+            (port reset after the cancel: rc=0; the measured recovery for the EP0 wedge)
+      75us      181us  CANCELLED     128/255
+            (port reset after the cancel: rc=0; the measured recovery for the EP0 wedge)
+     100us      224us  CANCELLED     128/255
+            (port reset after the cancel: rc=0; the measured recovery for the EP0 wedge)
+     125us      132us  COMPLETED     228/255
+     150us      130us  COMPLETED     228/255
+     300us      143us  COMPLETED     228/255
+    2000us      118us  COMPLETED     228/255
+
+  control 1 (deadline 0us): OK — a cancel really was produced (CANCELLED with 0 bytes; a partial count here is FINDING, not a control failure — a 0 us deadline still achieves its cut after the pump slice)
+  control 2 (deadline 2000us): OK — the device answers this request when it is not cut (228 bytes of the 255 asked — a string descriptor is legitimately shorter)
+
+  VERDICT  PARTIALS SURVIVE CANCELLATION: a control transfer cut after 196us reported libusb sz=64 of 255. On this host `sz` is a real, packet-quantised measurement, so gaster's `pad = overwrite_pad - sz` is exact and the packet-quantised sweep is NOT needed.

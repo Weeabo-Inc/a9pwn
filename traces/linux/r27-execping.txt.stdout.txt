@@ -1,0 +1,53 @@
+capacity   0x2be8 command bytes, from --capacity (TYPED BY HAND: not traceable to a run — prefer --capacity-from)
+  capacity     0x2be8 command bytes (measured; the ladder's lower bound)
+# a9boot exec — payload a9boot/target/aarch64-unknown-none-softfloat/payload/a9boot-payload -> flat: base 0x180380110, 10968 bytes delivered + 0 bytes .bss = 10968 bytes footprint (budget 16384), entry 0x180380110
+  command      EXEC PING (1), packet 11240 bytes = 6 DNLOAD transfers
+  staged at    0x180380110 (entry 0x180380110), inside the ROM's DFU buffer
+  verification 6 read-back chunk(s) of 2048 bytes, compared byte for byte
+  sequence     reference
+    step 1: DNLOAD command (11240 bytes, 6 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0
+    step 2: DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987
+    step 3: DNLOAD wLength 0 — the end of the download — gaster.c:833
+    step 4: DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833
+    step 5: DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST)
+    step 6: DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET)
+    step 7: UPLOAD wLength 128 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger
+
+  ORDER: stage (no trigger) -> read the staged bytes back -> compare -> re-stage -> trigger.
+  If the comparison fails, NOTHING IS EXECUTED (exit 9). That is the whole point: the
+  handler runs whatever the buffer holds the moment the 0xFFFF UPLOAD arrives.
+
+mode          live
+transport     LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.
+identity      CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]
+note          identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present
+note          DFU_GET_STATUS (read-only): status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+note          DFU state before staging: status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]
+note          payload: 10968 bytes staged at 0x180380110 (entry 6446121232), inside the ROM's DFU buffer; the EXEC packet is 11240 bytes = 6 DNLOAD transfers
+note          staged with the trigger DEFERRED: the handler has the command in its buffer and nothing has executed, because the trigger is the 0xFFFF UPLOAD and it has not been sent
+note          VERIFIED: all 10968 staged bytes at 0x180380110 match the host's image byte for byte. The verification read is what clobbers the reply area up to +0x810, which is why the image is re-staged next rather than triggered from here
+note          re-staged: the same bytes through the same path, and the DNLOAD offset resets between commands (MEASURED: two reads of two different addresses each returned their own value, RUNG2-EVIDENCE.md §1). The trigger's reply is the check on that inference
+note          no trigger reply: LIVE_UPLOAD_FAILED[status=TIMEOUT] (exec PING (10968 byte payload)): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+WARNING       TRIGGER_FAILED: LIVE_UPLOAD_FAILED[status=TIMEOUT] (exec PING (10968 byte payload)): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.. The payload was staged and verified, but the trigger did not answer. The device may have executed our code and then died — read the raw state before re-pwning: a fresh pwn is a resource (RUNG2-EVIDENCE.md §1.1).
+[0] exec PING (10968 byte payload): UNREAD — deferred stage: the trigger was deliberately not sent, so no reply                              exists for this command yet
+              DNLOAD 11240 bytes in 6 transfer(s), UPLOAD wLength 128, sequence reference
+[1] memc read 0x180380110 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1334 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[2] memc read 0x180380910 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1535 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[3] memc read 0x180381110 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1396 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[4] memc read 0x180381910 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1404 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[5] memc read 0x180382110 len 0x800: status OK, actual_length 2064/2064, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 2048 reply bytes, 1413 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 2064, sequence reference
+[6] memc read 0x180382910 len 0x2d8: status OK, actual_length 744/744, DONE_MAGIC + retval 0x180380010 (UNKNOWN_STATUS), 728 reply bytes, 871 µs
+              DNLOAD 72 bytes in 1 transfer(s), UPLOAD wLength 744, sequence reference
+[7] exec PING (10968 byte payload): UNREAD — deferred stage: the trigger was deliberately not sent, so no reply                              exists for this command yet
+              DNLOAD 11240 bytes in 6 transfer(s), UPLOAD wLength 128, sequence reference
+[8] exec PING (10968 byte payload): NO REPLY (status TIMEOUT) — LIVE_UPLOAD_FAILED[status=TIMEOUT] (exec PING (10968 byte payload)): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.
+              DNLOAD 11240 bytes in 6 transfer(s), UPLOAD wLength 128, sequence reference
+
+VERDICT       FAIL — TRIGGER_FAILED: LIVE_UPLOAD_FAILED[status=TIMEOUT] (exec PING (10968 byte payload)): Operation timed out. A timeout means the handler did not answer. STOP rather than retry: a cancelled control transfer can wedge EP0 on this bootrom (RUNG1-EVIDENCE.md §3), and a retry sends a second DNLOAD on top of a buffer whose state is now unknown. Check the serial still contains PWND:[checkm8] before deciding anything.. The payload was staged and verified, but the trigger did not answer. The device may have executed our code and then died — read the raw state before re-pwning: a fresh pwn is a resource (RUNG2-EVIDENCE.md §1.1).
+
+evidence written to a9pwn-traces/linux/r27-execping.json (schema a9boot.evidence/1)

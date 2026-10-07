@@ -1,0 +1,94 @@
+{
+  "schema": "a9boot.evidence/1",
+  "tool": "a9boot-host",
+  "tool_version": "0.1.0",
+  "command": "a9boot-host firstlight --live --sequence reference --read 0x1800e0f08:32 --json a9pwn-traces/linux/r18-canary.json",
+  "mode": "live",
+  "build": {
+    "usb_feature": true,
+    "dnload_chunk": 2048,
+    "reply_off": 16,
+    "payload_off": 272
+  },
+  "started_utc": "2026-10-03T13:49:23Z",
+  "finished_utc": "2026-10-03T13:49:23Z",
+  "wall_clock_ms": 0,
+  "success_criterion": "actual_length == wLength AND the reply begins with [DONE_MAGIC][retval]; the channel, the requested length and the transfer status are diagnostics and cannot establish success on their own",
+  "transport": "LiveTransport: 05ac:1227, 2048 byte DNLOAD chunks, 1000 ms timeout, descriptor [CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]]. UNVERIFIED-BY-TEST.",
+  "device": {
+    "identity_checked": true,
+    "identity": "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<redacted> IBFL:<redacted> SRTG:[iBoot-2234.0.0.2.22] PWND:[checkm8]",
+    "identity_error": null,
+    "serial": "REDACTED (never published)"
+  },
+  "exchanges": [
+    {
+      "index": 0,
+      "label": "memc read 0x1800e0f08 len 0x20",
+      "purpose": "SRAM (ROM heap / DFU buffer / resident handler) (read-only; the only bytes written are inside the ROM's DFU buffer)",
+      "request": {
+        "bmRequestType": "0x21",
+        "bRequest": "0x01 (DFU_DNLOAD)",
+        "wValue": "0x0000",
+        "wIndex": "0x0000",
+        "dnload_len": 72,
+        "dnload_transfers": 1,
+        "dnload_hex": "636d656d636d656d00000000000000001000388001000000080f0e800100000020000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "dnload_sha256": "9740dc3ac4e29d587207d0f77cf15772b230e9d98f84c9988e19689147d1e483",
+        "sequence": "reference",
+        "trigger": "now (stage + trigger)",
+        "sequence_steps": "DNLOAD command (72 bytes, 1 transfer(s)), bmRequestType 0x21 bRequest 0x01 wValue 0 wIndex 0 | DNLOAD 16 zero bytes (DFU_FILE_SUFFIX_LEN) — gaster.c:41,987 | DNLOAD wLength 0 — the end of the download — gaster.c:833 | DFU_GET_STATUS expect status 0 state 6 (dfuMANIFEST-SYNC) — gaster.c:833 | DFU_GET_STATUS expect status 0 state 7 (dfuMANIFEST) | DFU_GET_STATUS expect status 0 state 8 (dfuMANIFEST-WAIT-RESET) | UPLOAD wLength 48 bmRequestType 0xa1 bRequest 0x02 wValue 0xffff wIndex 0 — the trigger"
+      },
+      "trigger": {
+        "bmRequestType": "0xa1",
+        "bRequest": "0x02 (DFU_UPLOAD)",
+        "wValue": "0xffff",
+        "wIndex": "0x0000",
+        "wLength": 48
+      },
+      "start_us": 131,
+      "duration_us": 667,
+      "status": "OK",
+      "actual_length": 48,
+      "channel": "0x21/0x01 DNLOAD then 0xa1/0x02 wValue 0xffff UPLOAD",
+      "response": {
+        "bytes_read": 48,
+        "complete": true,
+        "upload_hex": "656e6f64656e6f64100038800100000007060058e0001fd6feffff17020040795f840a7161ffff54fd7bbfa9f353bfa9",
+        "upload_sha256": "d9a06b3eac0537cf756773c6a8728199dd355250463ee747d267819aee166d54"
+      },
+      "transport_error": null,
+      "parse": {
+        "state": "PARSED",
+        "reason": null,
+        "magic_hex": "0x646f6e65646f6e65",
+        "magic_ascii": "donedone",
+        "done_magic_ok": true,
+        "retval_hex": "0x0000000180380010",
+        "retval_label": "UNKNOWN_STATUS",
+        "data_len": 32,
+        "data_hex": "07060058e0001fd6feffff17020040795f840a7161ffff54fd7bbfa9f353bfa9"
+      },
+      "exchange_verdict": "PASS"
+    }
+  ],
+  "notes": [
+    "identity: CPID 0x8003, BDID 0x02, PWND:[checkm8] all present",
+    "DFU_GET_STATUS (read-only): status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]",
+    "DFU_GET_STATUS before the first exchange: status 0 (OK) state 8 (dfuMANIFEST-WAIT-RESET) [raw 0x00 32 00 00 0x08 0x00]"
+  ],
+  "warnings": [
+    "the DFU state is 8 (dfuMANIFEST-WAIT-RESET), not dfuIDLE. A DNLOAD that starts a *fresh* download is expected only in dfuIDLE; in any other state the ROM may append at an offset the host cannot see. If the first exchange fails, that is the first hypothesis to exclude, and a bus reset (`a9boot reset is Lead-only`) is the way back to dfuIDLE — not a retry.",
+    "PROVENANCE UNVERIFIED: this run made a single exchange, so nothing in it separates 'our command ran' from 'the buffer already began with DONE_MAGIC and the handler echoed it' (the handler re-sends the buffer unchanged when the command magic does not match, payload_handle_checkm8_request.S:68-74). `DONE_MAGIC` is INSPECTED from the reference, not measured on this device. A second read to a *different* address, or `--write`, is what upgrades this reply from 'the channel answered' to 'the channel answered *this* request'."
+  ],
+  "dfu_status_before": {"status": 0, "state": 8, "state_name": "dfuMANIFEST-WAIT-RESET", "accepts_a_fresh_dnload": false},
+  "not_proved_by_this_run": [
+    "the channel bindings (bmRequestType/bRequest/wValue/magic offsets) are INSPECTED from research/refs/gaster/payload_handle_checkm8_request.S, not MEASURED on this device: UNVERIFIED-BY-TEST until an exchange parses",
+    "that DONE_MAGIC in a reply proves OUR handler ran rather than the ROM echoing a buffer that happened to begin with it",
+    "that the ROM's DNLOAD write offset resets between commands (tested by two exchanges in one session to two *different* addresses, i.e. two --read options)",
+    "anything about DRAM: extent, reachability from EL3, or usability (that is the DRAM walk, a separate step)",
+    "that the a9boot payload can be executed at abi::payload_exec_addr() (EXEC is a separate step and UNVERIFIED-BY-TEST)"
+  ],
+  "verdict": "PASS",
+  "verdict_reason": null
+}
