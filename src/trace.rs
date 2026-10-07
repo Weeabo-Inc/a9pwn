@@ -90,6 +90,12 @@ pub mod kind {
     /// [`ResetEvidence::Delivered`] needs the transition out of `MANIFEST_WAIT_RESET`
     /// that only PATCH's walk arranges. Never a failure and never a success.
     pub const RESET_UNVERIFIED: &str = "reset_unverified";
+    /// A stage whose mechanics completed but whose claim is UNPROVEN — currently only the
+    /// RESET stage whose `bus_reset_delivered` predicate FAILED (review/07 finding 13: 139
+    /// `stage_pass` RESET events coexisted with 350 `bus_reset_delivered` FAILs and 0 PASSes).
+    /// A `stage_pass` may not coexist with its own failed predicate, so the pass claim is
+    /// withheld and this is written instead; the run's continue semantics are unchanged.
+    pub const STAGE_UNPROVEN: &str = "stage_unproven";
     /// One trip round the stage machine.
     pub const ROUND: &str = "round";
     /// A per-transfer record, written by [`super::Tracer::xfer`].

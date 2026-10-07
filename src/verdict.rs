@@ -42,7 +42,7 @@
 //! [`classify`] checks the driver before it interprets anything else.
 
 use crate::trace::{counters_one_line, Counters};
-use crate::types::{DeviceIdentity, DriverClass, ResetCapability, RunOutcome};
+use crate::types::{DeviceIdentity, DriverClass, ResetCapability, RunOutcome, Stage};
 
 // ---------------------------------------------------------------------- codes
 
@@ -51,6 +51,21 @@ use crate::types::{DeviceIdentity, DriverClass, ResetCapability, RunOutcome};
 pub const PWNED: &str = "PWNED";
 /// Reported pwned, but the marker above is absent — so it is not pwned.
 pub const PWNED_UNCONFIRMED: &str = "PWNED_UNCONFIRMED";
+/// The marker above is PRESENT, but this invocation's write path attempted
+/// **nothing** (`Counters.total() == 0`) — so the exploit did not run, and
+/// `[PWNED]` would be a claim about a state the run never produced. This is
+/// `RUNG2-EVIDENCE.md` §6.0p rule 14 made executable: *a cached value is not a
+/// measurement*, and *a write tool's verdict must be derived from its counters,
+/// not from the state it hopes it produced*. MEASURED 2026-10-03: `a9pwn run`
+/// printed `[PWNED]` with `transfers=0`, having read a marker left by a previous
+/// pwn and sent nothing.
+pub const PWNED_UNMEASURED: &str = "PWNED_UNMEASURED";
+/// The marker is present and this invocation's write path DID run — but **nothing at the PATCH
+/// stage** (`stage_total(Stage::Patch) == 0`), so this run did not install a payload and `[PWNED]`
+/// would attribute an earlier pwn to it (review/04 F6: `run --stage reset --force` on a marked
+/// device reached `[PWNED] confidence: High` with zero payload traffic). Rule 14's total gate is
+/// necessary but not sufficient: RESET and SETUP sweeps are transfers, not payload traffic.
+pub const PWNED_MARKER_PREEXISTING: &str = "PWNED_MARKER_PREEXISTING";
 /// Driver is WinUSB (or the reset measured as a pipe cycle): resets are no-ops.
 pub const NO_RESET_CAPABILITY: &str = "NO_RESET_CAPABILITY";
 /// The reset capability was never established.
@@ -108,6 +123,8 @@ pub const RUN_ABORTED: &str = "RUN_ABORTED";
 pub const CODES: &[&str] = &[
     PWNED,
     PWNED_UNCONFIRMED,
+    PWNED_UNMEASURED,
+    PWNED_MARKER_PREEXISTING,
     NO_RESET_CAPABILITY,
     RESET_CAPABILITY_UNKNOWN,
     RESET_NOT_DELIVERED,
@@ -182,7 +199,9 @@ pub struct Verdict {
 /// 1. reset capability — nothing else is interpretable when the driver cannot reset
 ///    at all, or when a reset was *measured* as a pipe cycle. An unverifiable reset
 ///    is not evidence and is never interpreted here;
-/// 2. success, by the reference's own `PWND:[checkm8]` predicate;
+/// 2. success, by the reference's own `PWND:[checkm8]` predicate **and** this
+///    invocation's write path having run (`Counters.total() > 0`): a marker with
+///    `transfers=0` is [`PWNED_UNMEASURED`], never `[PWNED]` (rule 14);
 /// 3. the discovery record, when no transfer happened: path length, then a node that
 ///    exists but will not open — the README's other three cases;
 /// 4. absence, with the census that proves it (or states that none was taken);
@@ -233,16 +252,28 @@ pub fn classify(
     // there (an earlier run, or another tool). The goal state is still achieved, so
     // the verdict says so, and it says plainly which of the two situations this is
     // rather than letting a reader assume the run did it.
+    //
+    // Rule 14 applies here too, and the counter decides it inside [`pwned`]: with
+    // `transfers=0` this run attempted nothing, so the marker was read, not
+    // produced, and the verdict is [`PWNED_UNMEASURED`] rather than `[PWNED]`.
     if ident.is_pwned() {
         let mut v = pwned(counters, ident);
         v.evidence.insert(
             0,
             format!(
-                "run: this run's own outcome was {outcome:?}, so IT did not produce the marker — the \
-                 device was already pwned when the run started. The marker is a measurement and \
+                "run: this run's own outcome was {outcome:?}. The marker's ORIGIN is therefore not \
+                 attributable to this invocation — the run did not report producing it — so read the \
+                 legs below as measurements of NOW (marker present; this invocation's PATCH traffic), \
+                 not as proof that this run performed the pwn. The marker is a measurement and \
                  outranks the driver/reset model below"
             ),
         );
+        // review/04 F6: a verdict whose own evidence says the marker's origin is unattributable
+        // must not print the same High confidence as a run that reported its own Pwned outcome —
+        // the headline and the evidence may not contradict each other in print.
+        if v.code == PWNED {
+            v.confidence = Confidence::Medium;
+        }
         return v;
     }
 
@@ -620,6 +651,10 @@ fn push_opt(v: &mut Vec<String>, item: Option<String>) {
 
 /// Which host a remedy is written for.
 ///
+/// Two arms only, and honestly so: `remedy_host` is Windows or *everything
+/// else* (this crate targets Windows and Linux; a macOS build would get the
+/// Linux text rather than a Windows tool it does not have).
+///
 /// A value, not a `cfg!` at each call site, so that a test on EITHER host can
 /// execute BOTH selections. The Windows text is contract (`HANDOFF.md` §9.3) and
 /// this project has paid five times for checks nobody could make fail; a Windows
@@ -664,7 +699,11 @@ fn remedy_for(host: RemedyHost, windows: &str, linux: &str) -> String {
 /// - `a9pwn reset` prints `capability` and `what happened`; a reset that returns
 ///   in the ~237 ms class with the device answering afterwards is a real
 ///   `USBDEVFS_RESET` port reset;
-/// - `a9pwn preflight` must print `reset: real bus reset`;
+/// - `a9pwn preflight` must show its `reset` line reading `real bus reset`
+///   (`main.rs` prints `reset         : real bus reset`; the remedies therefore
+///   say "the `reset` line reads `real bus reset`" rather than quoting a literal
+///   that is not in the output — an operator told to grep for a string the tool
+///   never prints concludes a PASSING preflight failed);
 /// - enumeration is `udevadm trigger --subsystem-match=usb` or unplug/replug;
 /// - permissions are `/dev/bus/usb` access (a udev rule for `05ac:1227`);
 /// - **no kernel driver bound (`usbfs`) is the NORMAL, working Linux state.**
@@ -691,15 +730,16 @@ const REMEDY_NO_RESET_CAPABILITY_WINDOWS: &str = "Run `a9drv bind --pid 1227` fr
 /// Linux remedy for [`no_reset_capability`]. On this host there is no driver
 /// table to act on, so the actionable thing is to MEASURE the reset instead of
 /// inheriting a Windows model's conclusion from it.
-const REMEDY_NO_RESET_CAPABILITY_LINUX: &str = "This is a missing MEASUREMENT, not a property of the device. First measure the reset \
-     instead of inferring it: run `a9pwn reset` and read its `capability` and `what happened` \
-     lines — a reset that returns in the ~237 ms class with the device answering afterwards is a \
-     real `USBDEVFS_RESET` port reset on this host. Then run `a9pwn preflight` and require it to \
-     print `reset: real bus reset`. On Linux the driver model this verdict is built on does not \
-     apply: no kernel driver bound (`usbfs`) is the NORMAL working state, and a kernel driver \
-     owning the node would be the anomaly. If `a9pwn reset` itself fails, fix /dev/bus/usb access \
-     for 05ac:1227 (a udev rule for the device) and the measurement in `usb.rs` before accusing \
-     the port. Do NOT run `a9drv bind` or zadig: those are Windows-only and have no meaning here.";
+const REMEDY_NO_RESET_CAPABILITY_LINUX: &str = "This is a missing MEASUREMENT, not a property \
+     of the device. First measure the reset instead of inferring it: run `a9pwn reset` and read \
+     its `capability` and `what happened` lines — a reset that returns in the ~237 ms class \
+     with the device answering afterwards is a real `USBDEVFS_RESET` port reset on this host. \
+     Then run `a9pwn preflight` and require its `reset` line to read `real bus reset`. On Linux \
+     the driver model this verdict is built on does not apply: no kernel driver bound (`usbfs`) \
+     is the NORMAL working state, and a kernel driver owning the node would be the anomaly. If \
+     `a9pwn reset` itself fails, fix /dev/bus/usb access for 05ac:1227 (a udev rule for the \
+     device) and the measurement in `usb.rs` before accusing the port. Do NOT run `a9drv bind` \
+     or zadig: those are Windows-only and have no meaning here.";
 
 fn no_reset_capability(
     c: &Counters,
@@ -792,26 +832,195 @@ fn no_reset_capability(
     }
 }
 
+/// The one claim a `[PWNED]` verdict is allowed to make about the payload's
+/// handler, and the one it is not.
+///
+/// The exploit's success predicate (`gaster.c:811`) is a substring of the serial
+/// descriptor. That is evidence about the DESCRIPTOR. Whether our interface-request
+/// handler is resident and answering is a DIFFERENT claim, and this crate holds no
+/// counter that observes it: `stages.rs`'s own recon note says, of the re-opened
+/// descriptor, *"for PATCH this is the only proof there is"* (`stages.rs:2359`), and
+/// no `Counters` field records a post-pwn handler reply. A step whose success is
+/// invisible must be named as invisible — so leg 3 says exactly that instead of
+/// letting `[PWNED]` imply the payload is serving requests. The measurement that
+/// would establish it is a handler command sent after the pwn, which this offline
+/// classifier cannot take.
+fn ev_handler_unestablished() -> String {
+    "handler: NOT ESTABLISHED — no observation in this invocation records our interface-request \
+     handler answering. The marker is a statement about the descriptor, not proof that the payload \
+     is resident and serving: `stages.rs:2359` says of this exact re-read \"for PATCH this is the \
+     only proof there is\", and no `Counters` field records a post-pwn handler reply. A handler \
+     command issued after the pwn is the measurement that would establish this leg."
+        .to_string()
+}
+
+/// The rule-14 refusal (`RUNG2-EVIDENCE.md` §6.0p): the descriptor carries the
+/// marker, but **the write path attempted nothing this invocation**
+/// (`Counters.total() == 0`), so `[PWNED]` would be a claim about a state the run
+/// never produced.
+///
+/// The three legs print separately because `[PWNED]` used to collapse three
+/// different measurements into one word:
+///
+/// 1. **did the exploit run?** — `Counters` says `transfers=0`: nothing was
+///    attempted, whatever the marker says;
+/// 2. **is the marker present?** — yes, and it was **read fresh, this invocation**
+///    (the `rawdfu` probe's phrasing: the value is not carried across runs);
+/// 3. **is the handler installed?** — NOT established; see [`ev_handler_unestablished`].
+///
+/// The marker leg alone is a true measurement and it is why this is not
+/// `PWNED_UNCONFIRMED`: the device may well be pwned from an earlier run. What is
+/// refused is the inference from "the marker is there" to "this write tool pwned
+/// it, so stop trying."
+fn pwned_unmeasured(c: &Counters, ident: &DeviceIdentity) -> Verdict {
+    let mut evidence = vec![
+        format!(
+            "exploit: NOTHING WAS ATTEMPTED — trace: {} (Counters, exact: `transfers=0` on a write \
+             path means nothing was attempted, whatever the verdict says — RUNG2-EVIDENCE.md \
+             §6.0p rule 14)",
+            counters_one_line(c)
+        ),
+        format!(
+            "marker: the USB serial descriptor carries PWND={} — read fresh, this invocation — \
+             rule 14 (the descriptor was re-read after the run; this leg says the marker is present \
+             NOW, not that the exploit ran)",
+            ident.pwnd.clone().unwrap_or_else(|| "absent".to_string())
+        ),
+        ev_handler_unestablished(),
+        ev_reference(
+            "gaster.c:811 sets its `pwned` flag to `strstr(usb_serial_num, \" PWND:[checkm8]\") \
+             != NULL` — that substring is the reference's success predicate, and it is read from \
+             the descriptor, not from the write path",
+        ),
+    ];
+    if let Some(no_run) = ev_no_run(c) {
+        evidence.push(no_run);
+    }
+    Verdict {
+        code: PWNED_UNMEASURED,
+        headline: "The checkm8 marker is present, but this invocation's write path attempted ZERO \
+                   transfers: the exploit did not run, so this is NOT a PWNED verdict."
+            .to_string(),
+        evidence,
+        next_action: "Run `a9pwn run --force` if you meant to pwn in this invocation: it runs the \
+                      exploit regardless of the marker, which is what re-pwning while an image sits \
+                      in the bootrom's download buffer needs — `transfers=0` on a skipped re-pwn is \
+                      rule 14's injury, and a Power + Home re-entry (the only other way to clear the \
+                      marker) destroys that buffered image. Then run `a9pwn ident` to record the \
+                      marker."
+            .to_string(),
+        confidence: Confidence::Low,
+    }
+}
+
+/// The PATCH-scoped refusal (review/04 F6): the marker is present and this invocation's write
+/// path RAN — but nothing at the PATCH stage did, so its transfers were ladder mechanics
+/// (RESET/SETUP/SPRAY move for any run) and no payload was installed by it. `[PWNED]` would
+/// attribute an earlier pwn to this invocation.
+///
+/// The firing shape is `a9pwn run --stage reset --force` (or `--stage setup`) against a device
+/// already carrying `PWND:[checkm8]` — MEASURED to print `[PWNED] confidence: High` before this
+/// gate existed. The three-leg discipline of [`pwned_unmeasured`] applies here too: what ran,
+/// what the marker says NOW, and what is NOT established.
+fn pwned_marker_preexisting(c: &Counters, ident: &DeviceIdentity) -> Verdict {
+    let mut evidence = vec![
+        format!(
+            "exploit scope: NO PATCH-STAGE TRAFFIC — trace: {} — per-stage transfers: RESET={} \
+             SETUP={} SPRAY={} PATCH={}. Ladder mechanics are transfers, not payload traffic: only \
+             PATCH uploads the payload, so this invocation installed none (review/04 F6).",
+            counters_one_line(c),
+            c.stage_total(Stage::Reset),
+            c.stage_total(Stage::Setup),
+            c.stage_total(Stage::Spray),
+            c.stage_total(Stage::Patch),
+        ),
+        format!(
+            "marker: the USB serial descriptor carries PWND={} — read fresh, this invocation. The \
+             marker is an EARLIER pwn's: nothing in this invocation's counters produced it (rule 14: \
+             a descriptor read measures NOW, not who wrote it).",
+            ident.pwnd.clone().unwrap_or_else(|| "absent".to_string())
+        ),
+        ev_handler_unestablished(),
+        ev_reference(
+            "gaster.c:811 sets `pwned` from `strstr(usb_serial_num, \" PWND:[checkm8]\")` — a \
+             descriptor predicate. Whether THIS invocation's payload install produced the marker is \
+             a different claim, and only PATCH-stage counters speak to it.",
+        ),
+    ];
+    if let Some(no_run) = ev_no_run(c) {
+        evidence.push(no_run);
+    }
+    Verdict {
+        code: PWNED_MARKER_PREEXISTING,
+        headline: "The checkm8 marker is present and this invocation sent transfers — but NONE at \
+                   the PATCH stage: this run did not install a payload, so this is NOT a PWNED \
+                   verdict from this run. The marker is an earlier pwn's."
+            .to_string(),
+        evidence,
+        next_action: "If you meant to pwn in THIS invocation, run `a9pwn run --force` — the full \
+                      ladder includes PATCH. If the device only needs to STAY pwned for the loader, \
+                      it already is: record the marker with `a9pwn ident` and move on."
+            .to_string(),
+        confidence: Confidence::Low,
+    }
+}
+
 fn pwned(c: &Counters, ident: &DeviceIdentity) -> Verdict {
+    // RULE 14 (`RUNG2-EVIDENCE.md` §6.0p). This gate is the whole fix, and it must
+    // live here rather than at each call site: `classify` reaches `pwned()` from
+    // three places — the run's own `Pwned` outcome, the marker-outranks-the-run
+    // branch, and the fallthrough match arm — and every one of them used to return
+    // `[PWNED]` on the marker alone.
+    //
+    // `Counters.total()` is the field `counters_one_line` prints as `transfers=`,
+    // so this is literally the counter the 2026-10-03 injury was visible in.
+    if c.total() == 0 {
+        return pwned_unmeasured(c, ident);
+    }
+    // F6's real gate (review/04; the plan's instrument fix 5): rule 14's `total() > 0` is
+    // necessary but NOT sufficient — the RESET/SETUP/SPRAY sweeps move transfers for any run, so
+    // `run --stage reset --force` against a device already carrying the marker reached
+    // `[PWNED] confidence: High` with ZERO payload traffic (F6 Path A, the mission's own
+    // operating mode for stage-filtered probes). `[PWNED]`'s claim — "the exploit ran this
+    // invocation" — is about the payload install, so its gate is the PATCH stage's own counters.
+    if c.stage_total(Stage::Patch) == 0 {
+        return pwned_marker_preexisting(c, ident);
+    }
     Verdict {
         code: PWNED,
-        headline: "Pwned: the bootrom's serial descriptor carries the checkm8 marker."
+        headline: "Pwned: the exploit ran this invocation (PATCH-stage counters carry the \
+                   payload's transfers) and the bootrom's serial descriptor carries the checkm8 \
+                   marker."
             .to_string(),
         evidence: vec![
             format!(
-                "device: PWND={} (USB serial descriptor, re-read after the run)",
+                "exploit: the write path ran — trace: {} (Counters, exact; `transfers` is the \
+                 counter rule 14 says decides whether anything was attempted)",
+                counters_one_line(c)
+            ),
+            format!(
+                "exploit scope: PATCH-stage transfers = {} — the [PWNED] gate is PATCH-scoped \
+                 (review/04 F6): RESET/SETUP/SPRAY transfers are ladder mechanics and cannot carry \
+                 this verdict",
+                c.stage_total(Stage::Patch)
+            ),
+            format!(
+                "marker: the USB serial descriptor carries PWND={} — read fresh, this invocation — \
+                 rule 14 (main.rs re-opens the device after the run and re-reads the descriptor; no \
+                 value is carried over from an earlier enumeration)",
                 ident.pwnd.clone().unwrap_or_else(|| "absent".to_string())
             ),
+            ev_handler_unestablished(),
             ev_reference(
                 "gaster.c:811 sets its `pwned` flag to `strstr(usb_serial_num, \" PWND:[checkm8]\") \
                  != NULL` — that substring is the reference's only success predicate",
             ),
-            ev_counts(c),
             ev_resets(c),
         ],
         next_action: "Nothing to do on the exploit side: run `a9pwn ident` to record the PWND marker \
-                      and hand the device to your loader. Do not re-run the exploit; the payload is \
-                      already resident."
+                      and hand the device to your loader. Do not re-run the exploit on this \
+                      invocation's evidence. The marker says the pwn landed; it does not establish \
+                      that the handler is resident (see the handler leg)."
             .to_string(),
         confidence: Confidence::High,
     }
@@ -831,17 +1040,17 @@ const REMEDY_PWNED_UNCONFIRMED_WINDOWS: &str = "Run `a9pwn ident` now: if the PW
 /// host-side confirmation is `lsusb` and the re-run does not carry the
 /// Windows-only `--allow-winusb` escape hatch, which has no meaning here (there
 /// is no pipe-cycle reset to override on `usbfs`).
-const REMEDY_PWNED_UNCONFIRMED_LINUX: &str = "Run `a9pwn ident` now: if the PWND marker is absent the device is not pwned. \
-     Re-enter SecureROM DFU by holding Power + Home ~8 s, then release Power and keep \
-     Home held ~10 s — this iPhone SE has a MECHANICAL Home button, and \
-     solid-state-Home devices (iPhone 7/8/X) use Power + VolDown instead, which does \
-     nothing here. The screen stays BLACK in DFU, so the host is the only reliable \
-     confirmation: `lsusb -d 05ac:1227` must list the node (VID_05AC&PID_1227), and if \
-     it does not, re-enumerate with `udevadm trigger --subsystem-match=usb` or unplug \
-     and replug the cable. Then run `a9pwn preflight`: it must print `reset: real bus \
-     reset` (no kernel driver bound — `usbfs` — is the NORMAL Linux state, and \
-     `a9pwn reset` in the ~237 ms class with the device answering afterwards is a real \
-     `USBDEVFS_RESET` port reset). Only then re-run `a9pwn run --rounds 64`.";
+const REMEDY_PWNED_UNCONFIRMED_LINUX: &str = "Run `a9pwn ident` now: if the PWND marker is \
+     absent the device is not pwned. Re-enter SecureROM DFU by holding Power + Home ~8 s, then \
+     release Power and keep Home held ~10 s — this iPhone SE has a MECHANICAL Home button, and \
+     solid-state-Home devices (iPhone 7/8/X) use Power + VolDown instead, which does nothing \
+     here. The screen stays BLACK in DFU, so the host is the only reliable confirmation: `lsusb \
+     -d 05ac:1227` must list the node (VID_05AC&PID_1227), and if it does not, re-enumerate \
+     with `udevadm trigger --subsystem-match=usb` or unplug and replug the cable. Then run \
+     `a9pwn preflight`: its `reset` line must read `real bus reset` (no kernel driver bound — \
+     `usbfs` — is the NORMAL Linux state, and `a9pwn reset` in the ~237 ms class with the \
+     device answering afterwards is a real `USBDEVFS_RESET` port reset). Only then re-run \
+     `a9pwn run --rounds 64`.";
 
 fn pwned_unconfirmed(c: &Counters, ident: &DeviceIdentity) -> Verdict {
     Verdict {
@@ -1003,13 +1212,6 @@ fn device_path_too_long(
     }
 }
 
-/// A node is present and the open failed with a non-libusb driver bound.
-///
-/// The reset capability is carried for signature parity with the other discovery
-/// builders and is deliberately unused: this verdict is decided by the census and
-/// the open error alone, so wiring `cap` into a `usb: ...` evidence line here would
-/// change the `evidence` of every `WRONG_DRIVER_BOUND` verdict for no measurement.
-///
 /// Windows remedy — CONTRACT, do not reflow. `{driver}` is substituted by
 /// `.replace`, not by `format!`, so the text stays a plain `&str` the tests can
 /// pin; the emitted bytes are identical to the `format!` this replaced.
@@ -1021,16 +1223,22 @@ const REMEDY_WRONG_DRIVER_BOUND_WINDOWS: &str = "Run `a9drv bind --pid 1227` fro
 /// normal Linux state is no kernel driver at all, so a kernel driver that owns
 /// the node is the anomaly to remove, and `/dev/bus/usb` access is the other
 /// thing that makes an open fail with a class of `other`.
-const REMEDY_WRONG_DRIVER_BOUND_LINUX: &str = "On Linux a kernel driver owning the DFU node is the exception, not the rule: `usbfs` \
-     with no kernel driver bound is the NORMAL working state, and `a9drv bind` / libusbK \
-     are Windows-only tools that do not exist on this host. `a9pwn ident` prints what it \
-     actually read (`driver service: {driver}`): find that driver in `lsusb -t` or the \
-     `driver` symlink under /sys/bus/usb/devices, unbind or blacklist it (a DFU device \
-     needs no kernel driver), then re-enumerate with `udevadm trigger \
-     --subsystem-match=usb` or a replug. Also confirm /dev/bus/usb access for 05ac:1227 \
-     (a udev rule for the device), then require `a9pwn preflight` to print `reset: real \
-     bus reset` before `a9pwn run`.";
+const REMEDY_WRONG_DRIVER_BOUND_LINUX: &str = "On Linux a kernel driver owning the node is the \
+     exception, not the rule: `usbfs` with no kernel driver bound is the NORMAL working state, \
+     and `a9drv bind` / libusbK are Windows-only tools that do not exist on this host. `a9pwn \
+     ident` prints what it actually read (`driver service: {driver}`): find that driver in \
+     `lsusb -t` or the `driver` symlink under /sys/bus/usb/devices, unbind or blacklist it (a \
+     device in SecureROM needs no kernel driver), then re-enumerate with `udevadm trigger \
+     --subsystem-match=usb` or a replug. Also confirm /dev/bus/usb access for 05ac:1227 (a udev \
+     rule for the device), then require `a9pwn preflight`'s `reset` line to read `real bus \
+     reset` before `a9pwn run`.";
 
+/// A node is present and the open failed with a non-libusb driver bound.
+///
+/// The reset capability is carried for signature parity with the other discovery
+/// builders and is deliberately unused: this verdict is decided by the census and
+/// the open error alone, so wiring `cap` into a `usb: ...` evidence line here would
+/// change the `evidence` of every `WRONG_DRIVER_BOUND` verdict for no measurement.
 fn wrong_driver_bound(
     c: &Counters,
     ident: &DeviceIdentity,
@@ -1072,13 +1280,6 @@ fn wrong_driver_bound(
     }
 }
 
-/// A node is present, the open failed, and no *wrong* driver can be named: either
-/// the service could not be read at all, or a libusb driver is bound and still
-/// refused the node.
-///
-/// As in [`wrong_driver_bound`], the reset capability is deliberately unused: the
-/// node never opened, so no reset was measurable. Adding it to `evidence` would be
-/// a fabricated measurement.
 /// Windows remedy for [`driver_bound_not_loaded`] — CONTRACT, do not reflow.
 const REMEDY_DRIVER_BOUND_NOT_LOADED_WINDOWS: &str = "Re-enumerate the node: run `pnputil /scan-devices` from an elevated prompt (or \
      unplug and replug the cable), and close any process still holding it — a stale \
@@ -1099,6 +1300,13 @@ const REMEDY_DRIVER_BOUND_NOT_LOADED_LINUX: &str = "Re-enumerate the node: `udev
      (a udev rule for the device), which is the usual cause on this host, and confirm \
      nothing else holds the node open.";
 
+/// A node is present, the open failed, and no *wrong* driver can be named: either
+/// the service could not be read at all, or a libusb driver is bound and still
+/// refused the node.
+///
+/// As in [`wrong_driver_bound`], the reset capability is deliberately unused: the
+/// node never opened, so no reset was measurable. Adding it to `evidence` would be
+/// a fabricated measurement.
 fn driver_bound_not_loaded(
     c: &Counters,
     ident: &DeviceIdentity,
@@ -1164,15 +1372,15 @@ const REMEDY_DEVICE_LOST_MID_RUN_WINDOWS: &str = "Power-cycle the phone, plug it
 /// Linux remedy for [`device_lost_mid_run`]. Same re-entry instructions, but the
 /// host-side confirmation is `lsusb`, the kernel's own record of the disconnect is
 /// `dmesg`, and re-enumeration is udev or a replug.
-const REMEDY_DEVICE_LOST_MID_RUN_LINUX: &str = "Power-cycle the phone, plug it directly into a root port with the cable that \
-     worked for `a9pwn ident` (no hub, no extension), then re-enter SecureROM DFU: \
-     hold Power + Home ~8 s, release Power, keep Home held ~10 s (mechanical-Home \
-     devices such as this iPhone SE use Power + Home; solid-state-Home devices use \
-     Power + VolDown). The screen stays BLACK in DFU, so confirm from the host with \
-     `lsusb -d 05ac:1227` (VID_05AC&PID_1227), and read `dmesg | tail` for the \
-     disconnect the kernel logged; if the node does not come back, `udevadm trigger \
-     --subsystem-match=usb` or unplug and replug re-enumerates it. Then re-run \
-     `a9pwn run --stage setup --setup-budget 64 --trace run.jsonl --verbose` and read \
+const REMEDY_DEVICE_LOST_MID_RUN_LINUX: &str = "Power-cycle the phone, plug it directly into a \
+     root port with the cable that worked for `a9pwn ident` (no hub, no extension), then \
+     re-enter SecureROM DFU: hold Power + Home ~8 s, release Power, keep Home held ~10 s \
+     (mechanical-Home devices such as this iPhone SE use Power + Home; solid-state-Home devices \
+     use Power + VolDown). The screen stays BLACK in DFU, so confirm from the host with `lsusb \
+     -d 05ac:1227` (VID_05AC&PID_1227), and `sudo dmesg | tail` for the disconnect the kernel \
+     logged (reading the kernel buffer needs root on this host); if the node does not come \
+     back, `udevadm trigger --subsystem-match=usb` or unplug and replug re-enumerates it. Then \
+     re-run `a9pwn run --stage setup --setup-budget 64 --trace run.jsonl --verbose` and read \
      the `per stage` line of the summary to see which stage lost it.";
 
 /// The device was present and then reported `NO_DEVICE`: it went away mid-run.
@@ -1383,14 +1591,14 @@ const REMEDY_RESET_NOT_DELIVERED_WINDOWS: &str = "Run `a9pwn reset` and read its
 /// Linux remedy for [`reset_not_delivered`]. There is no driver to rebind here:
 /// the actionable measurement is `a9pwn reset`'s own `capability`/`what happened`
 /// pair, and the actionable failure mode is `/dev/bus/usb` access.
-const REMEDY_RESET_NOT_DELIVERED_LINUX: &str = "Run `a9pwn reset` and read its `capability` and `what happened` lines: a reset that \
-     returns in the ~237 ms class with the device answering afterwards is a real \
-     `USBDEVFS_RESET` port reset, and `a9pwn preflight` must print `reset: real bus \
-     reset`. There is no driver to rebind here — no kernel driver bound (`usbfs`) is the \
-     NORMAL Linux state, and `a9drv bind` is a Windows-only tool that does not exist on \
-     this host. If `a9pwn reset` itself fails, check /dev/bus/usb access for 05ac:1227 \
-     (a udev rule for the device) and that nothing else holds the node. Do not raise \
-     --rounds: more rounds cannot help when the reset is not being delivered.";
+const REMEDY_RESET_NOT_DELIVERED_LINUX: &str = "Run `a9pwn reset` and read its `capability` and \
+     `what happened` lines: a reset that returns in the ~237 ms class with the device answering \
+     afterwards is a real `USBDEVFS_RESET` port reset, and `a9pwn preflight`'s `reset` line \
+     must read `real bus reset`. There is no driver to rebind here — no kernel driver bound \
+     (`usbfs`) is the NORMAL Linux state, and `a9drv bind` is a Windows-only tool that does not \
+     exist on this host. If `a9pwn reset` itself fails, check /dev/bus/usb access for 05ac:1227 \
+     (a udev rule for the device) and that nothing else holds the node. Do not raise --rounds: \
+     more rounds cannot help when the reset is not being delivered.";
 
 fn reset_not_delivered(
     c: &Counters,
@@ -1587,17 +1795,17 @@ const REMEDY_PAD_TIMEOUT_NOT_STALL_WINDOWS: &str = "Rule out the Windows reset t
      abort line with `xfer=0/2048` and `xfer_micros` near its window.";
 
 /// Linux remedy for [`pad_timeout_not_stall`]. The reset must still be ruled out
-/// FIRST — but on this host that means measuring it (`a9pwn preflight` must print
-/// `reset: real bus reset`), not rebinding a driver that does not exist.
-const REMEDY_PAD_TIMEOUT_NOT_STALL_LINUX: &str = "Rule out the reset first, on this host's terms: run `a9pwn preflight` and require \
-     `reset: real bus reset` — a reset that returns in the ~237 ms class with the device \
-     answering afterwards is a real `USBDEVFS_RESET` port reset, and there is no Windows \
-     pipe-cycle trap to fix by rebinding. If the capability is not real, check /dev/bus/usb \
-     access for 05ac:1227 (a udev rule for the device) and read `a9pwn reset`'s `what \
-     happened` line for an error. If the reset is real, re-run \
-     `a9pwn run --stage setup --abort-min-ms 1 --usb-timeout-ms 5 --trace setup.jsonl \
-     --verbose` (drops window 0, the zero-microsecond abort) and require at least one \
-     abort line with `xfer=0/2048` and `xfer_micros` near its window.";
+/// FIRST — but on this host that means measuring it (the `reset` line must read
+/// `real bus reset`), not rebinding a driver that does not exist.
+const REMEDY_PAD_TIMEOUT_NOT_STALL_LINUX: &str = "Rule out the reset first, on this host's \
+     terms: run `a9pwn preflight` and require its `reset` line to read `real bus reset` — a \
+     reset that returns in the ~237 ms class with the device answering afterwards is a real \
+     `USBDEVFS_RESET` port reset, and there is no Windows pipe-cycle trap to fix by rebinding. \
+     If the capability is not real, check /dev/bus/usb access for 05ac:1227 (a udev rule for \
+     the device) and read `a9pwn reset`'s `what happened` line for an error. If the reset is \
+     real, re-run `a9pwn run --stage setup --abort-min-ms 1 --usb-timeout-ms 5 --trace \
+     setup.jsonl --verbose` (drops window 0, the zero-microsecond abort) and require at least \
+     one abort line with `xfer=0/2048` and `xfer_micros` near its window.";
 
 fn pad_timeout_not_stall(
     c: &Counters,
@@ -1813,14 +2021,14 @@ const REMEDY_RESET_CAPABILITY_UNKNOWN_WINDOWS: &str = "Run `a9pwn reset` (a bare
 /// driver-model outcome, not a driver to rebind on this host: the measurement to
 /// establish is the ~237 ms `USBDEVFS_RESET`, and the failure to rule out is
 /// `/dev/bus/usb` access.
-const REMEDY_RESET_CAPABILITY_UNKNOWN_LINUX: &str = "Run `a9pwn reset` (a bare port reset) and read its `capability` and `what \
-     happened` lines, then run `a9pwn preflight` and require it to print `reset: real \
-     bus reset` — a reset that returns in the ~237 ms class with the device answering \
-     afterwards is a real `USBDEVFS_RESET` port reset on this host. If it reports `pipe \
-     cycle only`, there is no driver to rebind: no kernel driver bound (`usbfs`) is the \
-     NORMAL Linux state, and the fault is a measurement defect in `usb.rs` or /dev/bus/usb \
-     access for 05ac:1227 (a udev rule for the device) — fix that before running the \
-     exploit.";
+const REMEDY_RESET_CAPABILITY_UNKNOWN_LINUX: &str = "Run `a9pwn reset` (a bare port reset) and \
+     read its `capability` and `what happened` lines, then run `a9pwn preflight` and require \
+     its `reset` line to read `real bus reset` — a reset that returns in the ~237 ms class with \
+     the device answering afterwards is a real `USBDEVFS_RESET` port reset on this host. If it \
+     reports `pipe cycle only`, there is no driver to rebind: no kernel driver bound (`usbfs`) \
+     is the NORMAL Linux state, and the fault is a measurement defect in `usb.rs` or \
+     /dev/bus/usb access for 05ac:1227 (a udev rule for the device) — fix that before running \
+     the exploit.";
 
 fn reset_capability_unknown(
     c: &Counters,
@@ -1964,7 +2172,7 @@ mod tests {
 
     fn ident_a9() -> DeviceIdentity {
         DeviceIdentity::parse(
-            "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:00112233445566AA IBFL:1C \
+            "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:[REDACTED-IDENTITY] IBFL:1C \
              SRTG:[IBOOT-2234.0.0.2.22]",
         )
     }
@@ -1973,7 +2181,7 @@ mod tests {
     /// the ` PWND:[checkm8]` suffix in the serial descriptor (`gaster.c:811`).
     fn ident_pwned() -> DeviceIdentity {
         DeviceIdentity::parse(
-            "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:00112233445566AA IBFL:1C \
+            "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:[REDACTED-IDENTITY] IBFL:1C \
              SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
         )
     }
@@ -1987,6 +2195,24 @@ mod tests {
     /// fields were an afterthought rather than the measurement.
     fn counters(set: impl FnOnce(&mut Counters)) -> Counters {
         let mut c = Counters::default();
+        set(&mut c);
+        c
+    }
+
+    /// The transfers a REAL pwned ladder leaves behind — including the PATCH stage's payload
+    /// upload, recorded through the real [`Tracer`] so `stage_total(Stage::Patch) > 0` exactly
+    /// as a live run would produce it. `[PWNED]`'s gate is PATCH-scoped (review/04 F6), so a
+    /// fixture that claims `[PWNED]` must carry PATCH traffic — and a fixture that must NOT
+    /// claim it must omit it. This is the whole difference between [`pwned`] and
+    /// [`pwned_marker_preexisting`] in these tests.
+    fn pwn_ladder_counters(set: impl FnOnce(&mut Counters)) -> Counters {
+        let mut t = Tracer::new(None, false).expect("tracer");
+        t.xfer(
+            Stage::Patch,
+            "patch_payload",
+            &xf(XferStatus::Ok, 0x21, 1, 0, 0x800, 0x800, None),
+        );
+        let mut c = t.counters();
         set(&mut c);
         c
     }
@@ -2115,8 +2341,21 @@ mod tests {
         assert!(all.contains("pipe cycle only"), "{all}");
         assert!(all.contains("windows_winusb.c:3380-3420"), "{all}");
         assert!(all.contains("setup_pad_timeouts=384"), "{all}");
-        assert!(v.next_action.contains("a9drv bind --pid 1227"), "{}", v.next_action);
-        assert!(v.next_action.contains("elevated") || v.next_action.contains("ELEVATED"));
+        // The remedy is HOST-SELECTED (see `host_remedy`): the Windows text is
+        // contract and stays asserted on Windows, while a Linux run must never be
+        // handed `a9drv bind` — it does not exist there. Both assertions stay
+        // compiled in this file; only the one for the running host executes.
+        #[cfg(target_os = "windows")]
+        {
+            assert!(v.next_action.contains("a9drv bind --pid 1227"), "{}", v.next_action);
+            assert!(v.next_action.contains("elevated") || v.next_action.contains("ELEVATED"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(v.next_action, REMEDY_NO_RESET_CAPABILITY_LINUX);
+            assert!(!v.next_action.contains("from an ELEVATED prompt"), "{}", v.next_action);
+            assert!(!v.next_action.contains("zadig-2.9.exe"), "{}", v.next_action);
+        }
 
         // The same counters with a driver that can reset must NOT be blamed on the
         // driver: that is the whole point of the taxonomy.
@@ -2162,10 +2401,16 @@ mod tests {
     // `DriverCannotReset` resets as pipe cycles, and the reset block ran before
     // the success block. Each test pins one half of the fix.
 
-    /// The exact live case, with the counters the Linux run actually produced.
+    /// The exact live case, with the counters the Linux run actually produced —
+    /// plus the transfers a real run leaves behind. Under rule 14 the `ok` count is
+    /// not decoration: `pwned()` refuses `[PWNED]` at `transfers=0`, and the live
+    /// 2026-10-03 run that motivated this ordering was *also* the run whose trace
+    /// said `transfers=0`. A pwn that outranks the driver model is one the counters
+    /// show ran.
     #[test]
     fn a_measured_pwn_outranks_an_unmeasurable_driver_class() {
-        let c = counters(|c| {
+        let c = pwn_ladder_counters(|c| {
+            c.ok = 6;
             c.resets_attempted = 4;
             c.resets_pipe_cycle = 2;
         });
@@ -2192,7 +2437,7 @@ mod tests {
     fn a_measured_pwn_outranks_winusb() {
         let v = classify(
             &RunOutcome::Pwned,
-            &Counters::default(),
+            &pwn_ladder_counters(|c| c.ok = 6),
             &ident_pwned(),
             DriverClass::WinUsb,
             ResetCapability::PipeCycleOnly,
@@ -2215,10 +2460,15 @@ mod tests {
     /// task-1 landed, this same hardware correctly reports `usbfs` / `Real`, so the
     /// broken input can only be reconstructed from the counters that run left behind
     /// (`resets_attempted=4 resets_pipe_cycle=2`, `driver_class=unknown`).
+    ///
+    /// The `transfers` column is rule 14's boundary drawn through the matrix: a
+    /// `[PWNED]` row must have a write path that ran, and the marker-present row
+    /// with `transfers=0` must be refused. Both are pinned, so a future change
+    /// cannot collapse them again.
     #[test]
     fn the_pwn_outranks_the_driver_model_across_the_whole_matrix() {
-        // (label, outcome, ident, driver, cap, pipe_cycle_counter, expected code)
-        let cases: Vec<(&str, RunOutcome, DeviceIdentity, DriverClass, ResetCapability, u64, &str)> = vec![
+        // (label, outcome, ident, driver, cap, pipe_cycle_counter, transfers, expected code)
+        let cases: Vec<(&str, RunOutcome, DeviceIdentity, DriverClass, ResetCapability, u64, u64, &str)> = vec![
             (
                 "LIVE INCIDENT: pwned run, no classifiable driver, 2 pipe cycles",
                 RunOutcome::Pwned,
@@ -2226,6 +2476,7 @@ mod tests {
                 DriverClass::Unknown,
                 ResetCapability::Unknown,
                 2,
+                6,
                 PWNED,
             ),
             (
@@ -2235,6 +2486,7 @@ mod tests {
                 DriverClass::WinUsb,
                 ResetCapability::PipeCycleOnly,
                 0,
+                6,
                 PWNED,
             ),
             (
@@ -2244,16 +2496,40 @@ mod tests {
                 DriverClass::LibusbK,
                 ResetCapability::Real,
                 0,
+                0,
                 PWNED_UNCONFIRMED,
             ),
             (
-                "marker already present, this run exhausted: pwned, but not by this run",
+                "marker already present, this run exhausted after transferring: pwned, but not by \
+                 this run",
                 exhausted(64),
                 ident_pwned(),
                 DriverClass::Unknown,
                 ResetCapability::Unknown,
                 0,
+                5,
                 PWNED,
+            ),
+            (
+                "REVIEW/04 F6 FIRING SHAPE: marker + transfers but NO PATCH traffic (run --stage \
+                 reset --force on a marked device)",
+                exhausted(64),
+                ident_pwned(),
+                DriverClass::Unknown,
+                ResetCapability::Unknown,
+                0,
+                4,
+                PWNED_MARKER_PREEXISTING,
+            ),
+            (
+                "RULE 14: marker present, this run exhausted and sent NOTHING",
+                exhausted(64),
+                ident_pwned(),
+                DriverClass::Unknown,
+                ResetCapability::Unknown,
+                0,
+                0,
+                PWNED_UNMEASURED,
             ),
             (
                 "no marker, no driver, measured pipe cycles: the Windows diagnosis",
@@ -2262,6 +2538,7 @@ mod tests {
                 DriverClass::Unknown,
                 ResetCapability::Unknown,
                 2,
+                0,
                 NO_RESET_CAPABILITY,
             ),
             (
@@ -2271,15 +2548,28 @@ mod tests {
                 DriverClass::WinUsb,
                 ResetCapability::PipeCycleOnly,
                 0,
+                0,
                 NO_RESET_CAPABILITY,
             ),
         ];
 
-        for (label, outcome, ident, driver, cap, cycles, want) in cases {
-            let c = counters(|c| {
-                c.resets_attempted = if cycles > 0 { 4 } else { 0 };
-                c.resets_pipe_cycle = cycles;
-            });
+        for (label, outcome, ident, driver, cap, cycles, transfers, want) in cases {
+            // A `[PWNED]` row must carry PATCH traffic (review/04 F6's gate); the refusal rows
+            // deliberately carry none. The boundary is drawn through the matrix exactly like the
+            // `transfers` column draws rule 14's.
+            let c = if want == PWNED {
+                pwn_ladder_counters(|c| {
+                    c.ok = transfers;
+                    c.resets_attempted = if cycles > 0 { 4 } else { 0 };
+                    c.resets_pipe_cycle = cycles;
+                })
+            } else {
+                counters(|c| {
+                    c.ok = transfers;
+                    c.resets_attempted = if cycles > 0 { 4 } else { 0 };
+                    c.resets_pipe_cycle = cycles;
+                })
+            };
             let v = classify(&outcome, &c, &ident, driver, cap);
             assert_eq!(v.code, want, "case {label:?} -> got {} ({})", v.code, v.headline);
         }
@@ -2303,13 +2593,39 @@ mod tests {
         assert!(v.confidence == Confidence::High || v.confidence == Confidence::Low);
     }
 
+    /// **The firing control for the PATCH-scoped gate** (review/04 F6, Path A): the marker is
+    /// present and transfers happened — but none at PATCH, exactly `run --stage reset --force`
+    /// against a marked device, which MEASURED `[PWNED] confidence: High` before this gate. It
+    /// must refuse by name; reverting the gate turns this red.
+    #[test]
+    fn control_a_ladder_only_run_cannot_claim_pwned() {
+        let v = classify(
+            &RunOutcome::Pwned,
+            &counters(|c| c.ok = 4),
+            &ident_pwned(),
+            DriverClass::LibusbK,
+            ResetCapability::Real,
+        );
+        assert_eq!(v.code, PWNED_MARKER_PREEXISTING, "headline was: {}", v.headline);
+        let all = v.evidence.join("\n");
+        assert!(all.contains("NO PATCH-STAGE TRAFFIC"), "{all}");
+        assert!(v.confidence != Confidence::High, "{v:?}");
+    }
+
     /// Marker present but THIS run did not report success: the device is pwned, and
     /// the verdict must not let a reader believe this run did it.
+    ///
+    /// The run transferred AND uploaded at PATCH (rule 14's gate and review/04 F6's
+    /// PATCH-scoped gate are both satisfied), so `[PWNED]` is allowed — at Medium
+    /// confidence, with the note that the marker's ORIGIN is not attributable to this
+    /// invocation (F6: the headline may not contradict its own evidence in print).
+    /// The zero-transfer twin is [`a_zero_transfer_run_with_the_marker_is_not_pwned`],
+    /// and the no-PATCH twin is [`control_a_ladder_only_run_cannot_claim_pwned`].
     #[test]
     fn a_marker_present_before_the_run_is_pwned_and_says_the_run_did_not_do_it() {
         let v = classify(
             &exhausted(64),
-            &Counters::default(),
+            &pwn_ladder_counters(|c| c.ok = 4),
             &ident_pwned(),
             DriverClass::Unknown,
             ResetCapability::Unknown,
@@ -2317,10 +2633,72 @@ mod tests {
         assert_eq!(v.code, PWNED, "headline was: {}", v.headline);
         let all = v.evidence.join("\n");
         assert!(
-            all.contains("already pwned when the run started"),
-            "the verdict must say the run did not produce the marker: {all}"
+            all.contains("not attributable to this invocation"),
+            "the verdict must say the marker's origin is not this run's: {all}"
         );
         assert!(all.contains("Exhausted"), "{all}");
+        assert_eq!(
+            v.confidence,
+            Confidence::Medium,
+            "an unattributable origin is not High confidence (review/04 F6)"
+        );
+    }
+
+    /// **RULE 14's FALSIFIER (`RUNG2-EVIDENCE.md` §6.0p).**
+    ///
+    /// MEASURED 2026-10-03: on a device pwned earlier, `a9pwn run` read the
+    /// `PWND:[checkm8]` marker left by that *previous* pwn, its own trace said
+    /// `transfers=0`, it sent nothing, and it still printed `[PWNED]`. This is
+    /// that case, with its exact inputs: a zero-transfer run whose descriptor
+    /// carries the marker. RED against the pre-fix `pwned()` (which had no counter
+    /// gate) and green after the gate, by construction.
+    #[test]
+    fn a_zero_transfer_run_with_the_marker_is_not_pwned() {
+        // Both paths that reached `pwned()` with no write at all: the run's own
+        // `Pwned` outcome (stages.rs returns it on the marker alone) and a run
+        // whose descriptor was already marked when it finished.
+        for outcome in [RunOutcome::Pwned, exhausted(64)] {
+            let v = classify(
+                &outcome,
+                &Counters::default(), // transfers=0, exactly the measured trace
+                &ident_pwned(),
+                DriverClass::Unknown,
+                ResetCapability::Unknown,
+            );
+            assert_ne!(
+                v.code, PWNED,
+                "a zero-transfer run must not be PWNED (`transfers=0` is rule 14's injury): {v:?}"
+            );
+            assert_eq!(v.code, PWNED_UNMEASURED, "{outcome:?} -> {v:?}");
+            let all = v.evidence.join("\n");
+            assert!(all.contains("transfers=0"), "leg 1 must carry the counter that refutes it: {all}");
+            assert!(
+                all.contains("read fresh, this invocation"),
+                "leg 2 must say the marker was read this invocation, not cached: {all}"
+            );
+            assert!(
+                all.contains("NOT ESTABLISHED"),
+                "leg 3 must name the step whose success is invisible: {all}"
+            );
+            assert!(
+                v.confidence != Confidence::High,
+                "a refused pwn must not carry High confidence: {v:?}"
+            );
+        }
+
+        // NEGATIVE CONTROL, so the assertions above are not a tautology: the same
+        // device and the same marker, with the write path having run, IS pwned.
+        let v = classify(
+            &RunOutcome::Pwned,
+            &pwn_ladder_counters(|c| c.ok = 8),
+            &ident_pwned(),
+            DriverClass::Unknown,
+            ResetCapability::Unknown,
+        );
+        assert_eq!(
+            v.code, PWNED,
+            "the gate must fire on transfers=0, not on the marker alone: {v:?}"
+        );
     }
 
     /// Negative control for the pair above: with the marker ABSENT, the reset model
@@ -2362,6 +2740,7 @@ mod tests {
             ResetCapability::Unknown,
         );
         assert_eq!(v.code, NO_RESET_CAPABILITY);
+        assert_eq!(v.next_action, REMEDY_NO_RESET_CAPABILITY_LINUX);
         assert!(
             v.next_action.contains("missing MEASUREMENT"),
             "{}",
@@ -2556,12 +2935,15 @@ mod tests {
     #[test]
     fn success_requires_the_reference_marker() {
         let pwned = DeviceIdentity::parse(
-            "CPID:8003 CPRV:01 BDID:02 ECID:00112233445566AA SRTG:[IBOOT-2234.0.0.2.22] \
+            "CPID:8003 CPRV:01 BDID:02 ECID:[REDACTED-IDENTITY] SRTG:[IBOOT-2234.0.0.2.22] \
              PWND:[checkm8]",
         );
+        // Rule 14 + review/04 F6: the marker is necessary but no longer sufficient — the run
+        // must also have put transfers on the wire (rule 14) AND uploaded at PATCH (F6's
+        // PATCH-scoped gate), or the verdict is a PWNED_* refusal.
         let v = classify(
             &RunOutcome::Pwned,
-            &Counters::default(),
+            &pwn_ladder_counters(|c| c.ok = 9),
             &pwned,
             DriverClass::LibusbK,
             ResetCapability::Real,
@@ -2651,6 +3033,30 @@ mod tests {
 
         let mut sig = |v: Verdict| produced.push(v.code);
 
+        // PWNED: the marker present AND the write path ran at PATCH (rule 14's gate plus
+        // review/04 F6's PATCH-scoped gate).
+        sig(classify(
+            &RunOutcome::Pwned,
+            &pwn_ladder_counters(|c| c.ok = 8),
+            &DeviceIdentity::parse(
+                "CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
+            ),
+            DriverClass::LibusbK,
+            ResetCapability::Real,
+        ));
+        // PWNED_MARKER_PREEXISTING: the marker and transfers, but NOTHING at PATCH — ladder
+        // mechanics may not claim the payload install (review/04 F6).
+        sig(classify(
+            &RunOutcome::Pwned,
+            &counters(|c| c.ok = 8),
+            &DeviceIdentity::parse(
+                "CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
+            ),
+            DriverClass::LibusbK,
+            ResetCapability::Real,
+        ));
+        // PWNED_UNMEASURED: the same marker with nothing attempted — the state
+        // rule 14 says must not print `[PWNED]`.
         sig(classify(
             &RunOutcome::Pwned,
             &Counters::default(),
@@ -2939,6 +3345,29 @@ mod tests {
     fn reachable_verdicts(seed: Verdict) -> Vec<Verdict> {
         let a9 = ident_a9();
         let mut out = vec![seed];
+        // PWNED: marker present AND the write path ran at PATCH (rule 14 + review/04 F6's
+        // PATCH-scoped gate).
+        out.push(classify(
+            &RunOutcome::Pwned,
+            &pwn_ladder_counters(|c| c.ok = 8),
+            &DeviceIdentity::parse(
+                "CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
+            ),
+            DriverClass::LibusbK,
+            ResetCapability::Real,
+        ));
+        // PWNED_MARKER_PREEXISTING: marker + transfers, but NOTHING at PATCH — ladder
+        // mechanics may not claim the payload install (review/04 F6).
+        out.push(classify(
+            &RunOutcome::Pwned,
+            &counters(|c| c.ok = 8),
+            &DeviceIdentity::parse(
+                "CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
+            ),
+            DriverClass::LibusbK,
+            ResetCapability::Real,
+        ));
+        // PWNED_UNMEASURED: same marker, zero transfers (rule 14).
         out.push(classify(
             &RunOutcome::Pwned,
             &Counters::default(),
@@ -3218,5 +3647,628 @@ mod tests {
         assert_eq!(v.code, SPRAY_LEAK_NOT_ZERO);
         assert!(v.evidence.join("\n").contains("LEAK_WINDEX_GASTER"));
         assert!(v.next_action.contains("--leak-windex-ipwndfu"), "{}", v.next_action);
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-aware remedies: the Windows contract, executable on either host
+    // -----------------------------------------------------------------------
+    //
+    // Before this section, `verdict.rs` handed Linux operators `a9drv bind`,
+    // `zadig-2.9.exe` and `pnputil /scan-devices` — none of which exist on this
+    // host — and `next_action` is the field a reader ACTS on. Three different
+    // tests, because one cannot do all three jobs:
+    //
+    //   1. `remedy_pairs_state_both_hosts_texts` — the selector and the detector,
+    //      every pair asserted from both hosts' side, with the detector's own
+    //      sensitivity as the negative control;
+    //   2. `the_windows_remedies_are_the_bytes_the_presplit_file_emitted` — the
+    //      whole Windows set pinned by hash, so "unchanged" is a MEASUREMENT and
+    //      not an assertion;
+    //   3. `every_reachable_next_action_is_non_empty_and_host_correct` plus
+    //      `no_windows_only_invocation_escapes_the_windows_consts` — the whole
+    //      domain of `classify`, and the whole file, rather than the handy sample
+    //      (HANDOFF §9.3: a test named for a property passed while checking three
+    //      of eleven cases).
+    //
+    // Each of the three has a negative control that was run and shown to fail:
+    // see `the_windows_only_detector_fails_on_a_doctored_linux_remedy`,
+    // `the_windows_manifest_detects_a_single_doctored_byte`, and the doctored
+    // source inside `no_windows_only_invocation_escapes_the_windows_consts`.
+
+    /// Every remedy that names Windows-only tooling, as `(code, Windows, Linux)`.
+    ///
+    /// Order is the order the builders appear in this file. The set is pinned by
+    /// `remedy_pairs_cover_the_whole_set`: a pair missing from this table is a
+    /// pair whose Linux half no test ever reads.
+    const REMEDY_PAIRS: &[(&str, &str, &str)] = &[
+        (
+            NO_RESET_CAPABILITY,
+            REMEDY_NO_RESET_CAPABILITY_WINDOWS,
+            REMEDY_NO_RESET_CAPABILITY_LINUX,
+        ),
+        (
+            PWNED_UNCONFIRMED,
+            REMEDY_PWNED_UNCONFIRMED_WINDOWS,
+            REMEDY_PWNED_UNCONFIRMED_LINUX,
+        ),
+        (DEVICE_ABSENT, REMEDY_DEVICE_ABSENT_WINDOWS, REMEDY_DEVICE_ABSENT_LINUX),
+        (
+            DEVICE_PATH_TOO_LONG,
+            REMEDY_DEVICE_PATH_TOO_LONG_WINDOWS,
+            REMEDY_DEVICE_PATH_TOO_LONG_LINUX,
+        ),
+        (
+            WRONG_DRIVER_BOUND,
+            REMEDY_WRONG_DRIVER_BOUND_WINDOWS,
+            REMEDY_WRONG_DRIVER_BOUND_LINUX,
+        ),
+        (
+            DRIVER_BOUND_NOT_LOADED,
+            REMEDY_DRIVER_BOUND_NOT_LOADED_WINDOWS,
+            REMEDY_DRIVER_BOUND_NOT_LOADED_LINUX,
+        ),
+        (
+            DEVICE_LOST_MID_RUN,
+            REMEDY_DEVICE_LOST_MID_RUN_WINDOWS,
+            REMEDY_DEVICE_LOST_MID_RUN_LINUX,
+        ),
+        (
+            IDENTITY_UNREADABLE,
+            REMEDY_IDENTITY_UNREADABLE_WINDOWS,
+            REMEDY_IDENTITY_UNREADABLE_LINUX,
+        ),
+        (WRONG_BOOT_STAGE, REMEDY_WRONG_BOOT_STAGE_WINDOWS, REMEDY_WRONG_BOOT_STAGE_LINUX),
+        (
+            RESET_NOT_DELIVERED,
+            REMEDY_RESET_NOT_DELIVERED_WINDOWS,
+            REMEDY_RESET_NOT_DELIVERED_LINUX,
+        ),
+        (
+            ABORT_CANCELLED_EARLY,
+            REMEDY_ABORT_CANCELLED_EARLY_WINDOWS,
+            REMEDY_ABORT_CANCELLED_EARLY_LINUX,
+        ),
+        (
+            PAD_TIMEOUT_NOT_STALL,
+            REMEDY_PAD_TIMEOUT_NOT_STALL_WINDOWS,
+            REMEDY_PAD_TIMEOUT_NOT_STALL_LINUX,
+        ),
+        (
+            PAD_ERROR_NOT_STALL,
+            REMEDY_PAD_ERROR_NOT_STALL_WINDOWS,
+            REMEDY_PAD_ERROR_NOT_STALL_LINUX,
+        ),
+        (
+            RESET_CAPABILITY_UNKNOWN,
+            REMEDY_RESET_CAPABILITY_UNKNOWN_WINDOWS,
+            REMEDY_RESET_CAPABILITY_UNKNOWN_LINUX,
+        ),
+    ];
+
+    /// Windows-only *content*, in two layers, because one layer is not enough —
+    /// and a reviewer proved it: appending
+    /// ``If that fails run `a9drv bind` or open Zadig.`` to a Linux remedy left
+    /// every test green, because ``a9drv bind`` without ``--pid 1227`` and
+    /// ``Zadig`` without ``.exe`` are different strings from the ones a
+    /// single-layer list happens to hold.
+    ///
+    /// **Layer 1 — exact invocations.** A phrase that tells the reader to run a
+    /// tool, or a host-side check, that only a Windows host has. A finding
+    /// wherever it appears, including inside a prohibition: a Linux remedy has no
+    /// reason to spell one out this precisely.
+    ///
+    /// **Layer 2 — a Windows tool NAME in a sentence that does not forbid it.**
+    /// The Linux remedies DO name these tools — in order to forbid them — so the
+    /// name is the finding only when its sentence carries no prohibition:
+    /// "Do NOT run `a9drv bind`" passes, "run `a9drv bind`" does not.
+    ///
+    /// `libusbK` and `WinUSB` are deliberately NOT names here: they are driver
+    /// *classes* a verdict must be able to REPORT (`driver service: {driver}`,
+    /// "not a libusb driver"), not tools the reader is told to run. A prescription
+    /// that names one of them also names `a9drv` or `install`, which layer 2 does
+    /// cover. This is still a lexical bound, not a proof: it pins the markers
+    /// below, and `remedy_pairs_state_both_hosts_texts` proves the bound is not
+    /// vacuous by making it fire on every Windows half.
+    const WINDOWS_ONLY_INVOCATIONS: &[&str] = &[
+        "`a9drv bind --pid 1227`",
+        "zadig-2.9.exe",
+        "pnputil",
+        "Get-PnpDevice",
+        "Select-String",
+        "king.exe",
+        "from an ELEVATED prompt",
+        "--allow-winusb",
+        "`char dev_id[256]`",
+    ];
+
+    /// Windows-only tool names for layer 2, matched case-insensitively. These may
+    /// not appear in ANY emitted field, evidence included.
+    /// `powershell`, `setupapi` and `dpinst` were added after a reviewer showed
+    /// "Run PowerShell to re-enumerate the node." passed the first version.
+    const WINDOWS_TOOL_NAMES: &[&str] = &[
+        "a9drv",
+        "zadig",
+        "pnputil",
+        "get-pnpdevice",
+        "select-string",
+        "king.exe",
+        "device manager",
+        "allow-winusb",
+        "powershell",
+        "dpinst",
+    ];
+
+    /// Windows-only internals that must not appear in a REMEDY but may legitimately
+    /// appear in `evidence`, whose job is to name the measurement: the
+    /// `device_path_too_long` evidence says "measured by our own SetupAPI pass", and
+    /// that is a citation, not an instruction. A reviewer's mutation showed that
+    /// leaving evidence entirely unchecked also let a prescription through, so
+    /// evidence IS checked — against layer 1 and the tool names above, not these.
+    const WINDOWS_ONLY_INTERNALS: &[&str] = &["setupapi", "dev_id[256]", "elevated prompt"];
+
+    /// A clause carrying a Windows tool name is a finding unless it also says
+    /// why that tool is not usable here.
+    ///
+    /// `no` and `cannot` are in this list because a reviewer's false-positive
+    /// probe showed correct remedies written as "There is no `zadig` on this
+    /// host." and "This host cannot run `a9drv`." were rejected. A check that
+    /// rejects correct text gets loosened by the next author, which is how a
+    /// detector dies, so the natural phrasings must pass.
+    ///
+    /// Deliberately NOT position-aware: requiring the negation to precede the
+    /// name would reject the equally natural "`a9drv bind` is not available on
+    /// this host". Clause splitting (on `,` and `—` as well as sentence enders)
+    /// is what keeps this honest — a prescription in a LATER clause cannot hide
+    /// behind a negation in an earlier one.
+    const PROHIBITIONS: &[&str] = &[
+        "not",
+        "never",
+        "without",
+        "cannot",
+        "no",
+        "isn't",
+        "doesn't",
+        "don't",
+        "windows-only",
+        "unavailable",
+    ];
+
+    /// `needle` occurs in `haystack` as a whole word. Substring matching let the
+    /// prohibition `not` match inside `Notably`, which is how a reviewer got
+    /// "Notably, run `a9drv bind` elevated." past the first version of layer 2.
+    fn contains_word(haystack: &str, needle: &str) -> bool {
+        let bytes = haystack.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = haystack[from..].find(needle) {
+            let start = from + rel;
+            let end = start + needle.len();
+            let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    fn windows_only_marker_named(text: &str, names: &[&'static str]) -> Option<&'static str> {
+        if let Some(invocation) = WINDOWS_ONLY_INVOCATIONS
+            .iter()
+            .copied()
+            .find(|t| text.contains(t))
+        {
+            return Some(invocation);
+        }
+        let lower = text.to_ascii_lowercase();
+        // CLAUSES, not just sentences: a reviewer showed that
+        // "The `a9drv bind` tool is not available here, so run `a9drv bind` elevated."
+        // satisfied a sentence-scoped prohibition with a negation belonging to a
+        // different clause.
+        for clause in lower.split(['.', ';', ':', '!', '?', ',', '—']) {
+            if let Some(name) = names.iter().copied().find(|n| clause.contains(n)) {
+                if !PROHIBITIONS.iter().any(|p| contains_word(clause, p)) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    /// A finding in `next_action` and `headline`: layer 1, every tool name, and the
+    /// Windows internals a remedy must not prescribe.
+    fn windows_only_marker(text: &str) -> Option<&'static str> {
+        windows_only_marker_named(text, WINDOWS_TOOL_NAMES)
+            .or_else(|| windows_only_marker_named(text, WINDOWS_ONLY_INTERNALS))
+    }
+
+    /// A finding in `evidence`: layer 1 and the tool names, but not the internals
+    /// that evidence cites as the source of a measurement.
+    #[cfg(test)]
+    fn windows_only_marker_in_evidence(text: &str) -> Option<&'static str> {
+        windows_only_marker_named(text, WINDOWS_TOOL_NAMES)
+    }
+
+    /// The only placeholder any remedy text carries. `wrong_driver_bound` is
+    /// reached exclusively with `DriverClass::Other` (see `classify`), so "other"
+    /// is the substitution that site can actually emit.
+    fn fill_placeholder(text: &str) -> String {
+        text.replace("{driver}", "other")
+    }
+
+    /// The Windows remedy set as bytes: placeholder filled, each text followed by
+    /// 0x1f. Computed over the consts, so a byte change anywhere in the set moves
+    /// the hash.
+    fn windows_remedy_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        for (_code, windows, _linux) in REMEDY_PAIRS {
+            out.extend_from_slice(fill_placeholder(windows).as_bytes());
+            out.push(0x1f);
+        }
+        out
+    }
+
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The selector, both ways, and the detector's sensitivity — on whichever
+    /// host runs the suite, because `remedy_for` takes the host as a value.
+    #[test]
+    fn remedy_pairs_state_both_hosts_texts() {
+        assert!(!REMEDY_PAIRS.is_empty());
+        for (code, windows, linux) in REMEDY_PAIRS {
+            assert_ne!(windows, linux, "{code} has one text for two hosts");
+            assert_eq!(
+                remedy_for(RemedyHost::Windows, windows, linux),
+                *windows,
+                "{code}: the Windows text must come back byte for byte"
+            );
+            assert_eq!(remedy_for(RemedyHost::Linux, windows, linux), *linux, "{code}");
+            // Negative control for the selector: it must not leak the Windows
+            // text to Linux, or every check below would be testing nothing.
+            assert_ne!(
+                remedy_for(RemedyHost::Linux, windows, linux),
+                *windows,
+                "{code}: the Linux selection returned the Windows text"
+            );
+            // …and each arm must genuinely IGNORE the other host's argument: a
+            // poisoned argument cannot change what the selected host emits.
+            assert_eq!(
+                remedy_for(RemedyHost::Windows, windows, "POISONED LINUX ARM"),
+                *windows,
+                "{code}: the Windows selection read the Linux argument"
+            );
+            assert_eq!(
+                remedy_for(RemedyHost::Linux, "POISONED WINDOWS ARM", linux),
+                *linux,
+                "{code}: the Linux selection read the Windows argument"
+            );
+            // Negative control for the detector: it must FIRE on every Windows
+            // half. Its silence on the Linux halves only means something if it
+            // can see these tokens at all.
+            assert!(
+                windows_only_marker(windows).is_some(),
+                "{code}: no Windows-only invocation found in the Windows remedy, so the detector \
+                 is blind and its verdict on the Linux remedy proves nothing: {windows}"
+            );
+            assert_eq!(
+                windows_only_marker(linux),
+                None,
+                "{code}: the Linux remedy prescribes a Windows-only invocation: {linux}"
+            );
+        }
+    }
+
+    /// §9.3's lesson applied to this table: a table named for the whole set must
+    /// pin the whole set. If a builder grows a Windows/Linux pair, this is what
+    /// notices that the pair was never added here.
+    #[test]
+    fn remedy_pairs_cover_the_whole_set() {
+        let mut codes: Vec<&str> = REMEDY_PAIRS.iter().map(|(c, _, _)| *c).collect();
+        let n = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "a code appears twice in REMEDY_PAIRS");
+        let mut expected = vec![
+            NO_RESET_CAPABILITY,
+            PWNED_UNCONFIRMED,
+            DEVICE_ABSENT,
+            DEVICE_PATH_TOO_LONG,
+            WRONG_DRIVER_BOUND,
+            DRIVER_BOUND_NOT_LOADED,
+            DEVICE_LOST_MID_RUN,
+            IDENTITY_UNREADABLE,
+            WRONG_BOOT_STAGE,
+            RESET_NOT_DELIVERED,
+            ABORT_CANCELLED_EARLY,
+            PAD_TIMEOUT_NOT_STALL,
+            PAD_ERROR_NOT_STALL,
+            RESET_CAPABILITY_UNKNOWN,
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            codes, expected,
+            "the remedied set changed: add the new pair to REMEDY_PAIRS, or its Linux text is \
+             pinned by nothing"
+        );
+    }
+
+    /// The detector's negative control, with the doctoring OUTSIDE the table: a
+    /// Linux remedy that grows a Windows invocation must be caught even though
+    /// `REMEDY_PAIRS` still holds the clean text.
+    #[test]
+    fn the_windows_only_detector_fails_on_a_doctored_linux_remedy() {
+        let text = REMEDY_PAD_TIMEOUT_NOT_STALL_LINUX;
+        assert_eq!(windows_only_marker(text), None, "the baseline must be clean");
+        let doctored = format!(
+            "{text} If that fails, run `a9drv bind --pid 1227` from an ELEVATED prompt."
+        );
+        assert_eq!(
+            windows_only_marker(&doctored),
+            Some("`a9drv bind --pid 1227`"),
+            "the detector must catch a Windows invocation appended to a Linux remedy"
+        );
+        // …and the selector would hand that doctored text to Linux unchanged,
+        // which is exactly how the live incident reached an operator.
+        assert_eq!(remedy_for(RemedyHost::Linux, "windows text", &doctored), doctored);
+    }
+
+    /// The other way a Windows-only instruction could reach a Linux operator:
+    /// through an ARGUMENT, not through the literal. `wrong_driver_bound` is the
+    /// one remedy that interpolates (`{driver}`), so the closed set of values it
+    /// can interpolate is pinned here — every `DriverClass` variant, not the one
+    /// the tests happen to use.
+    #[test]
+    fn the_interpolated_driver_name_cannot_smuggle_a_windows_marker_into_a_linux_remedy() {
+        let classes = [
+            DriverClass::LibusbK,
+            DriverClass::Libusb0,
+            DriverClass::WinUsb,
+            DriverClass::Usbfs,
+            DriverClass::Other,
+            DriverClass::Unknown,
+        ];
+        for class in &classes {
+            let text = REMEDY_WRONG_DRIVER_BOUND_LINUX.replace("{driver}", class.as_str());
+            assert_eq!(
+                windows_only_marker(&text),
+                None,
+                "driver_class={} puts a Windows marker into the Linux remedy: {text}",
+                class.as_str()
+            );
+        }
+        // Negative control: an interpolated value that DID carry a tool name would
+        // be caught, so the loop above is not vacuous.
+        let doctored = REMEDY_WRONG_DRIVER_BOUND_LINUX.replace("{driver}", "pnputil");
+        assert!(windows_only_marker(&doctored).is_some());
+        // …and the same check on the Windows half must FIRE on the real value, or
+        // the `None`s above would only mean the detector is asleep.
+        let windows_text = REMEDY_WRONG_DRIVER_BOUND_WINDOWS.replace("{driver}", "other");
+        assert!(windows_only_marker(&windows_text).is_some());
+    }
+
+    /// The whole Windows *remedy* set, by hash — not every Windows-visible
+    /// string: `evidence` still cites Windows internals by design and is not
+    /// pinned here. Pinned from the pre-split file
+    /// (`/tmp/verdict.rs.orig`, sha256 `02C85CBA1E7256C6…`) by a script that
+    /// decoded each original Rust literal with the compiler's own rules and
+    /// reported all 14 sites byte-identical before this constant was written;
+    /// `/tmp/compare_windows.py` reproduces that comparison. FNV-1a is not a
+    /// cryptographic hash — it detects ACCIDENTAL change, which is what a
+    /// regression pin is for; the byte-identity proof is decode-and-compare.
+    #[test]
+    fn the_windows_remedies_are_the_bytes_the_presplit_file_emitted() {
+        const WINDOWS_REMEDY_FNV1A64: u64 = 0xFD10_3BB1_7430_5133;
+        assert_eq!(
+            fnv1a64(&windows_remedy_bytes()),
+            WINDOWS_REMEDY_FNV1A64,
+            "a Windows remedy changed: the Windows behaviour is contract (HANDOFF §9.3)"
+        );
+    }
+
+    /// Negative control for the hash above: one byte is enough to move it, so a
+    /// green hash is evidence rather than a constant that never had a chance to
+    /// fail.
+    #[test]
+    fn the_windows_manifest_detects_a_single_doctored_byte() {
+        let clean = windows_remedy_bytes();
+        let pin = fnv1a64(&clean);
+        assert_eq!(pin, 0xFD10_3BB1_7430_5133);
+        let mut doctored = clean.clone();
+        // A trailing space on the last Windows remedy — the smallest edit that
+        // would still be invisible to a human reading a log.
+        doctored.insert(doctored.len() - 2, b' ');
+        assert_ne!(
+            fnv1a64(&doctored),
+            pin,
+            "the manifest cannot see a one-byte change"
+        );
+    }
+
+    /// Every code `classify` can return, from the Windows-model seed and from the
+    /// Linux-measured seed, so the property "no `next_action` hands a Linux
+    /// operator a Windows-only invocation" is checked over the whole domain and
+    /// not over the sample that happened to be handy (HANDOFF §9.3).
+    fn every_reachable_verdict() -> Vec<Verdict> {
+        let windows_model = classify(
+            &exhausted(64),
+            &setup_log_counters(),
+            &ident_a9(),
+            DriverClass::WinUsb,
+            ResetCapability::PipeCycleOnly,
+        );
+        // The LIVE Linux incident's counters: no classifiable driver, a measured
+        // pipe cycle, and a run that produced no marker.
+        let linux_measured = classify(
+            &exhausted(4),
+            &counters(|c| {
+                c.resets_attempted = 4;
+                c.resets_pipe_cycle = 2;
+            }),
+            &ident_a9(),
+            DriverClass::Unknown,
+            ResetCapability::Unknown,
+        );
+        let mut all = reachable_verdicts(windows_model);
+        all.extend(reachable_verdicts(linux_measured));
+        all
+    }
+
+    #[test]
+    fn every_reachable_next_action_is_non_empty_and_host_correct() {
+        let verdicts = every_reachable_verdict();
+
+        let mut codes: Vec<&str> = verdicts.iter().map(|v| v.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        let mut expected = CODES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            codes, expected,
+            "this test must cover every code `classify` can return, not a sample"
+        );
+
+        for v in &verdicts {
+            assert!(
+                !v.next_action.trim().is_empty(),
+                "{} has an empty next_action",
+                v.code
+            );
+            assert!(!v.headline.trim().is_empty(), "{} has an empty headline", v.code);
+            // Every emitted field is checked, not just the one the operator acts
+            // on: `headline` is the first line they read, and `evidence` is what
+            // they check the verdict against. The exemption this used to carry
+            // ("evidence cites `windows_winusb.c`") was not needed — that citation
+            // carries no marker — and a reviewer put a prescription in evidence to
+            // prove the gap was real.
+            #[cfg(target_os = "linux")]
+            {
+                let fields = [
+                    ("next_action", &v.next_action),
+                    ("headline", &v.headline),
+                ];
+                for (field, text) in fields {
+                    if let Some(hit) = windows_only_marker(text) {
+                        panic!(
+                            "{} hands a Linux operator Windows-only content in its {field} \
+                             ({hit:?}): {text}",
+                            v.code
+                        );
+                    }
+                }
+                for (i, evidence) in v.evidence.iter().enumerate() {
+                    if let Some(hit) = windows_only_marker_in_evidence(evidence) {
+                        panic!(
+                            "{} hands a Linux operator Windows-only content in evidence[{i}] \
+                             ({hit:?}): {evidence}",
+                            v.code
+                        );
+                    }
+                }
+            }
+        }
+
+        // The Linux halves are not merely clean, they are REACHABLE: a table
+        // entry no input can produce would be a pin on dead text.
+        #[cfg(target_os = "linux")]
+        for (code, _windows, linux) in REMEDY_PAIRS {
+            let want = fill_placeholder(linux);
+            assert!(
+                verdicts.iter().any(|v| v.next_action == want),
+                "{code}: no input reaches the Linux remedy in REMEDY_PAIRS"
+            );
+        }
+    }
+
+    /// The audit walk, as a function, so its negative control can run it on a
+    /// doctored SOURCE instead of on a token.
+    ///
+    /// A line may carry a Windows invocation only while it is inside a
+    /// `_WINDOWS` remedy const. Comments and doc comments are prose about the
+    /// rule, not remedies, and are skipped.
+    fn windows_invocations_outside_windows_consts(production: &str) -> Vec<String> {
+        let mut inside_windows_const = false;
+        let mut violations = Vec::new();
+        for (index, raw) in production.lines().enumerate() {
+            let code = raw.split_once("//").map(|(code, _)| code).unwrap_or(raw);
+            // Boundary detection on the COMMENT-STRIPPED line as well, so prose
+            // mentioning `_WINDOWS: &str =` can neither open nor close the region.
+            let declares = code.contains("_WINDOWS: &str =");
+            let closes = code.trim_end().ends_with("\";");
+            if !inside_windows_const && !declares {
+                // Layer 1 only. This walk sees SOURCE LINES, not sentences, so
+                // layer 2 would fire on the tail of a prohibition whose `NOT`
+                // sits on the previous line — it did exactly that on
+                // "or zadig: those are Windows-only and have no meaning here."
+                // Layer 2 is applied where it belongs: to the whole emitted
+                // string, in `every_reachable_next_action_is_non_empty_and_host_correct`.
+                if let Some(hit) = WINDOWS_ONLY_INVOCATIONS
+                    .iter()
+                    .copied()
+                    .find(|t| code.contains(t))
+                {
+                    violations.push(format!(
+                        "line {}: {hit:?} outside a _WINDOWS const: {code:?}",
+                        index + 1
+                    ));
+                }
+            }
+            if declares {
+                inside_windows_const = !closes;
+            } else if inside_windows_const && closes {
+                inside_windows_const = false;
+            }
+        }
+        violations
+    }
+
+    /// "No site was missed" as a check instead of a grep someone ran once: in the
+    /// production half of this file, every Windows-only invocation must sit
+    /// inside a `_WINDOWS` remedy const, because a remedy written inline would be
+    /// outside `REMEDY_PAIRS` and no other test could see it.
+    #[test]
+    fn no_windows_only_invocation_escapes_the_windows_consts() {
+        let source = include_str!("verdict.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("verdict.rs has a production half");
+        assert!(
+            production.len() < source.len(),
+            "the audit must stop at the test module, or it would ban its own token list"
+        );
+
+        let violations = windows_invocations_outside_windows_consts(production);
+        assert!(
+            violations.is_empty(),
+            "a Windows-only invocation escaped the Windows remedy consts ({} found):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+
+        // Negative control, on the REAL source: insert an inline Windows remedy
+        // and require the walk to find exactly it. Without this, an audit that
+        // silently matched nothing would look exactly like a clean file.
+        let doctored = production.replace(
+            "fn pwned(",
+            "const SNEAKY: &str = \"run `a9drv bind --pid 1227` elevated\";\nfn pwned(",
+        );
+        assert_ne!(doctored, production, "the doctoring anchor moved");
+        let caught = windows_invocations_outside_windows_consts(&doctored);
+        assert_eq!(
+            caught.len(),
+            1,
+            "the walk must catch an inline Windows remedy, and only it: {caught:?}"
+        );
+        assert!(
+            caught[0].contains("a9drv bind --pid 1227"),
+            "the walk caught the wrong line: {caught:?}"
+        );
     }
 }

@@ -135,6 +135,111 @@ impl Transport {
 }
 ```
 
+### 2.1 The Linux measurement surface (added session 3, 2026-10-03)
+
+On Linux there is no SetupAPI, so the Windows driver table cannot answer "what is
+bound, and can it reset?". Before this surface existed, `ident` printed
+`driver service: unknown` / `reset: unknown` on the only host that can pwn the
+device, and `main.rs`'s preflight gate refused to run. The surface below is the
+measurement that replaced that blindness. Everything here is `#[cfg(unix)]` except
+the constants; the Windows path is unchanged.
+
+```rust
+pub const SYSFS_ROOT_ENV: &str = "A9PWN_SYSFS_ROOT";   // overrides the sysfs root
+pub const REAL_SYSFS_ROOT: &str = "/sys";
+
+/// Resolve the sysfs root. The override exists so tests can point at FIXTURE trees
+/// and is the reason the whole surface is testable without a phone.
+pub fn sysfs_root_from(override_value: Option<&str>) -> std::path::PathBuf;
+pub fn sysfs_root() -> std::path::PathBuf;
+
+/// A sentence naming WHERE the root came from (real /sys vs an override), so a
+/// reader can never mistake a fixture result for a hardware one.
+pub fn root_provenance(root: &std::path::Path) -> String;
+
+/// Read-only scan of the device tree. Opens no device handle and writes nothing.
+/// `Err` means the scan could not be trusted — it is NEVER folded into "empty".
+pub fn scan_sysfs_usb_devices(root: &std::path::Path) -> Result<SysfsScan, String>;
+
+/// Interface 0's binding for one node of the scan.
+pub fn resolve_interface0(
+    root: &std::path::Path,
+    node: &SysfsUsbNode,
+) -> Result<SysfsInterfaceBinding, String>;
+
+/// The driver actually bound to (bus, address), and the note explaining it.
+/// Refuses when the scan finds no node, or more than one node, at that address.
+pub fn measure_sysfs_driver(
+    root: &std::path::Path,
+    bus: u8,
+    address: u8,
+) -> Result<SysfsDriverMeasurement, String>;
+```
+
+**Contracts a caller may rely on — and the ones it may NOT:**
+1. **`cannot read` is never `not there`.** An EACCES (or any unreadable path)
+   produces `Err` quoting the OS reason; it never becomes absence, and never
+   becomes `usbfs`. This is a MATERIAL-reviewed property with a chmod-000
+   negative control.
+2. **`usbfs` is a positive measurement**, not a fallback: it is the absence of a
+   `driver` symlink on interface 0, which is the normal, working state of a DFU
+   device on Linux. `DriverClass::Usbfs` therefore maps to
+   `ResetCapability::Unknown` in `types.rs::from_driver` — capability is decided
+   by the *measured* evidence here, never by the driver name.
+3. **A duplicate (bus, addr) is refused, not picked from.** Two nodes reporting
+   the same address produce an error.
+4. **The scan is bounded**: one `read_dir`, one pass, no recursion, no `unwrap`
+   on absent files, and malformed attribute content is quoted rather than
+   guessed at.
+
+### 2.2 The reset-call classification (added session 3 after a live regression)
+
+**Why this exists.** MEASURED 2026-10-03: the exploit's own SPRAY ends with a
+`DFU_CLRSTATUS` (`gaster.c:910`) that **takes the device off the bus for ~350-435 ms**
+(`RUNG1-EVIDENCE.md` §7). The next reset call therefore fails with
+`LIBUSB_ERROR_NOT_FOUND`. A gate that treats every failed call as "the host cannot
+reset" **stopped a run that was working** — our tool could not pwn a stock device at
+all until this distinction was made. The drop is the exploit's own, and the reference
+absorbs it (`gaster.c:197-200`, `:1268`; `wait_usb_handle` `:202-218`).
+
+```rust
+/// What a reset call actually did. `RefusedAbsent` and `RefusedPresent` are the
+/// distinction the regression turned on: the first is the KNOWN drop and the run
+/// continues; the second stops it.
+pub enum ResetCall {
+    Report,
+    RefusedAbsent { rc: i32, micros: u64, note: String },
+    RefusedPresent { rc: i32, micros: u64, note: String },
+}
+
+/// Exactly `LIBUSB_ERROR_NOT_FOUND` (-5) and `LIBUSB_ERROR_NO_DEVICE` (-4).
+pub fn reset_error_is_device_absent(rc: i32) -> bool;
+
+impl Transport { pub fn reset_call(&mut self) -> ResetCall; }   // `reset()` wraps it
+
+// stages.rs
+pub enum ResetDisposition { Continue, Stop }
+pub fn reset_failure_disposition(rc: i32, allow_winusb: bool) -> ResetDisposition;
+pub const KIND_RESET_AFTER_DROP: &str = "reset_after_drop";   // its own trace kind
+pub const OPEN_RETRY_BUDGET: Duration;   // 3 s wall clock (was 600 attempts)
+pub fn open_retry_allowed(/* … */) -> bool;
+pub fn open_retry_ok_note(/* … */) -> String;
+pub fn open_retry_exhausted_note(/* … */) -> String;
+```
+
+**Contracts:**
+1. **A refusal while the device is PRESENT still stops the run.** That is the case the
+   original gate existed for, and this change must not weaken it. Pinned by
+   both-direction negative controls: "every failure continues" and "absent also stops"
+   each make named tests fail.
+2. **The drop is its own evidence kind.** `KIND_RESET_AFTER_DROP` is deliberately a
+   kind that **no counter claims**, so it can never feed `resets_unrecorded` and
+   produce `RESET_NOT_DELIVERED` — which would blame the host for the exploit's own
+   drop. A test asserts `KIND_RESET_AFTER_DROP != kind::RESET`.
+3. **The wait is wall-clock bounded, not attempt-counted.** "19 open attempts" was
+   MEASURED to be 285-292 ms — a property of our pacing loop, not of the device
+   (LINUX-HANDOFF §4.8).
+
 `XferStatus` mapping is fixed and tested: `LIBUSB_TRANSFER_COMPLETED → Ok`,
 `STALL → Stall`, `TIMED_OUT → Timeout`, `CANCELLED → Cancelled`,
 `NO_DEVICE → NoDevice`, everything else → `Error`.
@@ -215,6 +320,11 @@ pub struct RunOptions {
     pub stage_filter: Option<Stage>,
     pub setup_budget: SetupBudget,
     pub stop_after_setup_stall: bool, // diagnostic: prove SETUP before spending PATCH
+    pub force: bool,                  // run the exploit even if the descriptor already carries
+                                      // PWND:[checkm8] (rule 14: without it a marked device sends
+                                      // nothing, transfers=0, and the verdict is PWNED_UNMEASURED).
+                                      // Needed to re-pwn while an image is held in the DFU buffer:
+                                      // a Power+Home re-entry destroys that image.
     pub settle_ms: u32,               // sleep between rounds; 0 = gaster's behaviour
 }
 impl Default for RunOptions { /* gaster's defaults: rounds 64, usb_timeout 5, abort_min 0 */ }
@@ -327,7 +437,7 @@ a9pwn reset                 bare port reset, reporting what it actually did
 a9pwn plan                  build the payload, print every field, send nothing
 a9pwn selftest              offline checks: blob hashes, struct sizes, config table, verdicts
 a9pwn run [--rounds N] [--dry-run] [--verbose] [--trace FILE]
-          [--stage reset|setup|spray|patch] [--allow-winusb]
+          [--stage reset|setup|spray|patch] [--allow-winusb] [--force]
           [--leak-windex-ipwndfu] [--stop-after-setup-stall] [--setup-budget N]
 ```
 

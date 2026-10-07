@@ -163,21 +163,41 @@ impl XferResult {
             && !self.timing_refuted()
     }
 
+    /// Is `transferred` a wire MEASUREMENT?
+    ///
+    /// True only for a completed transfer (`Ok`): the synchronous control API
+    /// (`libusb_control_transfer`, libusb "Synchronous device I/O") returns the
+    /// byte count on success and a bare negative `LIBUSB_ERROR_*` on failure —
+    /// there is no `transferred` out-parameter, unlike bulk/interrupt. So the
+    /// construction site's `transferred = if rc >= 0 { … } else { 0 }`
+    /// (`usb.rs`) FABRICATES the 0 on every failure: the true partial length is
+    /// not recoverable from this API. Nothing may read `transferred` as data
+    /// unless this returns true — the read path reports the buffer's prefix as
+    /// unverified instead, and `one_line` marks such rows `XFER-UNMEASURED`.
+    pub fn transferred_measured(&self) -> bool {
+        self.status == XferStatus::Ok
+    }
+
     /// Stable, greppable, colourless. Designed to be pasted into a report.
     ///
     /// The trailing markers are derived from the fields, never stored:
     /// `SUBMICRO` from [`Self::timing_refuted`] and `UNREAPED` from
-    /// [`Self::unreaped`]. They are mutually exclusive by construction.
+    /// [`Self::unreaped`]. They are mutually exclusive by construction;
+    /// `XFER-UNMEASURED` from [`Self::transferred_measured`] is orthogonal and
+    /// marks a substituted (fabricated) transfer count.
     pub fn one_line(&self) -> String {
         let abort = match self.abort_after_ms {
             Some(ms) => format!(" abort={ms}ms"),
             None => String::new(),
         };
-        let flags = match (self.timing_refuted(), self.unreaped()) {
-            (true, _) => " SUBMICRO",
-            (_, true) => " UNREAPED",
-            _ => "",
+        let mut flags = match (self.timing_refuted(), self.unreaped()) {
+            (true, _) => " SUBMICRO".to_string(),
+            (_, true) => " UNREAPED".to_string(),
+            _ => String::new(),
         };
+        if !self.transferred_measured() {
+            flags.push_str(" XFER-UNMEASURED");
+        }
         format!(
             "seq={:<6} {:<9} bm=0x{:02X} b=0x{:02X} wV=0x{:04X} wI=0x{:04X} wL={:<5} \
              xfer={}/{} {:>9}us rc={}{}{}",
@@ -861,16 +881,20 @@ mod tests {
         let clean = sample(XferStatus::Ok);
         assert!(!clean.one_line().contains("SUBMICRO"));
         assert!(!clean.one_line().contains("UNREAPED"));
+        assert!(!clean.one_line().contains("XFER-UNMEASURED"), "{}", clean.one_line());
 
         let mut fast = sample(XferStatus::Error);
         fast.micros = 0;
-        assert!(fast.one_line().ends_with("SUBMICRO"), "{}", fast.one_line());
+        assert!(fast.one_line().contains("SUBMICRO"), "{}", fast.one_line());
+        // Instrument fix 2's marker: a failed transfer's `transferred` is the sync API's
+        // substitution, never a measurement — and the row says so in greppable form.
+        assert!(fast.one_line().contains("XFER-UNMEASURED"), "{}", fast.one_line());
 
         let mut lost = sample(XferStatus::Error);
         lost.libusb_rc = LIBUSB_ERROR_OTHER;
         lost.abort_after_ms = Some(2);
         lost.micros = 2_001_000;
-        assert!(lost.one_line().ends_with("UNREAPED"), "{}", lost.one_line());
+        assert!(lost.one_line().contains("UNREAPED"), "{}", lost.one_line());
         assert!(lost.one_line().contains("abort=2ms"), "{}", lost.one_line());
     }
 

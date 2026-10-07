@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod payload;
+pub mod readwindow;
 pub mod stages;
 pub mod trace;
 pub mod types;

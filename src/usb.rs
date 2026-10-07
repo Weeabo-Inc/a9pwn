@@ -384,6 +384,46 @@ pub struct ResetReport {
     pub note: String,
 }
 
+/// What one `libusb_reset_device` call produced, with the two failure kinds
+/// kept apart.
+///
+/// Three outcomes, and collapsing any two of them is how a working run gets
+/// blamed on its host:
+///
+///   * [`ResetCall::Report`] — the call returned; the report says what it did
+///     (which may be nothing, and says so).
+///   * [`ResetCall::RefusedAbsent`] — the call failed because the **device was
+///     not there** (`LIBUSB_ERROR_NOT_FOUND` / `LIBUSB_ERROR_NO_DEVICE`). On
+///     this bootrom that is the exploit's own `DFU_CLRSTATUS` drop
+///     (`gaster.c:910`), measured at 435 ms with a re-enumeration; the reference
+///     absorbs it (`wait_usb_handle`, `:202-218`).
+///   * [`ResetCall::RefusedPresent`] — the call failed for any other reason,
+///     i.e. while the device was attached. That is a real capability problem and
+///     must still stop a run.
+#[derive(Debug, Clone)]
+pub enum ResetCall {
+    Report(ResetReport),
+    RefusedAbsent { rc: i32, micros: u64, note: String },
+    RefusedPresent { rc: i32, micros: u64, note: String },
+}
+
+/// Is this `LIBUSB_ERROR_*` code the device being **absent**, or the reset being
+/// refused while it is present?
+///
+/// Pure, and pinned over the whole libusb error domain rather than the two codes
+/// seen so far — the §9.3 lesson: a table tested on a sample ratifies the cells
+/// nobody looked at. `LIBUSB_ERROR_NOT_FOUND` (-5) is what this host produced
+/// when the spray's `DFU_CLRSTATUS` dropped the device; `LIBUSB_ERROR_NO_DEVICE`
+/// (-4) is the same situation one layer out. Every other code — including
+/// `LIBUSB_ERROR_IO`, `ACCESS`, `BUSY`, `TIMEOUT`, `PIPE`, `OTHER` and success
+/// itself — means the call was refused with the device still on the bus.
+pub fn reset_error_is_device_absent(rc: i32) -> bool {
+    matches!(
+        rc,
+        sys::constants::LIBUSB_ERROR_NOT_FOUND | sys::constants::LIBUSB_ERROR_NO_DEVICE
+    )
+}
+
 /// The human sentence for a reset. Pure, so every branch is testable without a
 /// device.
 ///
@@ -1195,8 +1235,16 @@ impl Transport {
             interface_claimed,
         );
 
+        // The class travels with the reading: on Linux it is classified exactly
+        // (`linux_driver_class`), not by `DriverClass::from_service`'s substring
+        // rule, so the driver line and the capability line cannot disagree.
+        #[cfg(unix)]
+        let driver_class = linux_driver_class(&reading);
+        #[cfg(windows)]
+        let driver_class = DriverClass::from_service(&reading.service);
+
         transport.driver_service = reading.service;
-        transport.driver = DriverClass::from_service(&transport.driver_service);
+        transport.driver = driver_class;
         transport.capability = reading.capability;
         transport.capability_note = reading.capability_note;
         notes.push(reading.note);
@@ -1483,6 +1531,14 @@ impl Transport {
         let micros = started.elapsed().as_micros() as u64;
 
         let status = XferStatus::from_libusb_rc(rc);
+        // THE FABRICATION, named (instrument fix 2; review/04 F8): on `rc < 0` the synchronous
+        // API — `libusb_control_transfer`, libusb "Synchronous device I/O" — returns a bare
+        // negative `LIBUSB_ERROR_*` with NO `transferred` out-parameter (unlike bulk/interrupt,
+        // which populate one even on timeout). The true partial length is therefore NOT
+        // RECOVERABLE here, and this 0 is FABRICATED, not measured. Consumers must gate on
+        // `XferResult::transferred_measured()`; `one_line` marks such rows `XFER-UNMEASURED`,
+        // and the read path keeps the buffer's prefix as unverified rather than claiming
+        // "the device returned 0 of N bytes".
         let transferred = if rc >= 0 {
             (rc as usize).min(requested)
         } else {
@@ -1925,6 +1981,39 @@ impl Transport {
     /// A genuine reset usually invalidates the handle — the device
     /// re-enumerates — so the caller re-opens afterwards, as gaster does.
     pub fn reset(&mut self) -> Result<ResetReport, String> {
+        match self.reset_call() {
+            ResetCall::Report(report) => Ok(report),
+            ResetCall::RefusedAbsent { note, .. } | ResetCall::RefusedPresent { note, .. } => Err(note),
+        }
+    }
+
+    /// Reset the port, with the failure **classified** rather than flattened.
+    ///
+    /// [`Transport::reset`] collapses every failure into one `Err`, which is
+    /// right for an operator asking "did it reset?" and wrong for the run loop,
+    /// which has to tell two different situations apart (MEASURED on this host,
+    /// 2026-10-03 — a stock device, our own run):
+    ///
+    /// ```text
+    ///   SPRAY: stage_pass
+    ///   post-stage reset: libusb_reset_device failed: LIBUSB_ERROR_NOT_FOUND (-5)
+    ///                     after 2 us with driver service 'usbfs'
+    /// ```
+    ///
+    /// That `-5` is **not** the host refusing to reset. The A9 spray's last line
+    /// is a `DFU_CLRSTATUS` (`gaster.c:910`), and a bare one drops this bootrom
+    /// off the bus and it re-enumerates by itself — MEASURED as E2 on
+    /// 2026-10-03: the device left the bus and returned **435 ms later at a new
+    /// address**, PWND marker intact. `gaster` absorbs exactly this: it resets
+    /// after every stage and discards the result (`gaster.c:197-200`, `:1268`),
+    /// and `wait_usb_handle` (`:202-218`) simply loops until a handle appears
+    /// again. So the drop caused by the exploit must never be attributed to the
+    /// host's reset capability — that is the difference between
+    /// [`ResetCall::RefusedAbsent`] and [`ResetCall::RefusedPresent`].
+    ///
+    /// The state pre-read is still taken first, so a report is produced whenever
+    /// the call completed at all.
+    pub fn reset_call(&mut self) -> ResetCall {
         let dfu_state_before = self.dfu_status_state(DFU_STATE_TIMEOUT_MS);
 
         let started = Instant::now();
@@ -1934,14 +2023,35 @@ impl Transport {
         let capability = self.reset_capability();
 
         if rc != sys::constants::LIBUSB_SUCCESS {
-            return Err(format!(
+            let note = format!(
                 "libusb_reset_device failed: {} ({rc}) after {micros} us with driver service \
                  '{}'. Nothing was confirmed: no bus reset was delivered and no pipe cycle was \
                  reported either. The reference ignores this return value and continues; doing \
                  the same is a choice the caller may make, but it is not evidence.",
                 libusb_error_name(rc),
                 self.driver_service()
-            ));
+            );
+            return if reset_error_is_device_absent(rc) {
+                ResetCall::RefusedAbsent {
+                    rc,
+                    micros,
+                    note: format!(
+                        "{note} The code says the DEVICE WAS ABSENT, not that the reset was \
+                         refused: the exploit's own DFU_CLRSTATUS drops this bootrom and it \
+                         re-enumerates by itself (MEASURED 435 ms, new address, 2026-10-03). \
+                         Continue after waiting for it to come back."
+                    ),
+                }
+            } else {
+                ResetCall::RefusedPresent {
+                    rc,
+                    micros,
+                    note: format!(
+                        "{note} The device was present and the call was still refused, which is a \
+                         capability problem, not the known drop."
+                    ),
+                }
+            };
         }
 
         // Read the device back. A real port reset does not cycle VBUS and keeps
@@ -1963,7 +2073,7 @@ impl Transport {
             dfu_state_after,
         );
 
-        Ok(ResetReport {
+        ResetCall::Report(ResetReport {
             libusb_rc: rc,
             interface_claimed: self.interface_claimed,
             dfu_state_before,
@@ -3453,12 +3563,37 @@ pub fn measure_sysfs_driver(
 /// The host-side driver reading: the service string, the note, and the reset
 /// capability with the evidence that produced it.
 ///
-/// Fields are private to this module; `Transport` copies them out.
+/// Fields are private to this module; `Transport` copies them out. The driver
+/// *class* is derived from `service` at the call site — `DriverClass::from_service`
+/// on Windows, [`linux_driver_class`] on Linux — so the driver line and the
+/// capability line are always classified from the same measurement.
 struct DriverReading {
     service: String,
     note: String,
     capability: ResetCapability,
     capability_note: String,
+}
+
+/// Classify the Linux driver answer, exactly.
+///
+/// **Why not [`DriverClass::from_service`].** That function matches on substring
+/// (`s.contains("usbfs")`, `types.rs:383-384`), while the capability path here
+/// compares the measured name exactly. A kernel driver literally named
+/// `usbfs-kernel` bound to interface 0 would therefore print `driver service:
+/// usbfs` in the same `ident` block whose next line says `reset: unknown` — two
+/// answers to one question, and the reassuring one is the wrong one. On Linux
+/// the measurement is exact, so the classification is too: only the literal
+/// `usbfs` is the usbfs path (MEASURED: the reviewer's `usbfs-something-kernel`
+/// fixture reproduced the contradiction this prevents), and any other bound
+/// kernel driver is `Other` — a readable, non-libusb binding, which is what
+/// `DriverClass::Other` means.
+#[cfg(unix)]
+fn linux_driver_class(reading: &DriverReading) -> DriverClass {
+    match reading.service.as_str() {
+        "usbfs" => DriverClass::Usbfs,
+        "" => DriverClass::Unknown,
+        _ => DriverClass::Other,
+    }
 }
 
 /// Classify the Linux reset capability from the *measured* host path.
@@ -3548,12 +3683,16 @@ fn linux_driver_reading(
         note: measured.note.clone(),
         capability: ResetCapability::Real,
         capability_note: format!(
-            "reset capability REAL, from three measurements: (a) {}. (b) interface 0 was claimed \
-             at open, so the interface is this transport's. (c) libusb's Linux backend maps \
-             libusb_reset_device to ioctl(USBDEVFS_RESET) — linux_usbfs.c:1578-1596, \
-             _IO('U', 20) at linux_usbfs.h:149 — which the kernel performs as a genuine port \
-             reset on the host controller, not a pipe cycle. This host path is the one the \
-             reference implementation pwned this device through (MEASURED 2026-10-03).",
+            "reset capability REAL, from two measurements plus one source inspection: \
+             (a) MEASURED — {}. (b) MEASURED — interface 0 was claimed at open, so the interface \
+             is this transport's. (c) INSPECTED, not measured here (no reset has been attempted \
+             at this point, and none can be from a pure function) — libusb's Linux backend maps \
+             libusb_reset_device to ioctl(USBDEVFS_RESET): op_reset_device at linux_usbfs.c:1578, \
+             the ioctl at :1596, _IO('U', 20) at linux_usbfs.h:149. The kernel performs that \
+             ioctl as a genuine port reset on the host controller, not a pipe cycle; the \
+             reference implementation pwned this device through this host path \
+             (MEASURED 2026-10-03). Capability is Real because (a) and (b) held; (c) is what \
+             makes a per-call reset reportable as a bus reset rather than a pipe cycle.",
             measured.note
         ),
     }
@@ -3730,12 +3869,41 @@ mod tests {
         };
         let raw = ctx.as_raw();
 
+        // Windows: 0, 1, 2, 4, 5 ms — gaster's sweep — each window retried until
+        // it is **proven** honoured, up to a bounded number of attempts.
+        //
+        // WHY THIS ASSERTION HAS THE SHAPE IT HAS. The defect this test exists
+        // for is the Windows tick: a sub-tick wait was rounded up, so windows
+        // 1..5 all truncated at ~11.7 ms absolute — 6.7 ms or more OVER their
+        // deadlines — and *every* window did. Two facts follow:
+        //
+        //   * load can only ever ADD time to a trial, so a single trial is a
+        //     measurement of the machine's load, not of the mechanism. The
+        //     pre-fix form of this test asserted `best-of-3 < window + 5 ms` for
+        //     every window and flaked: MEASURED 2026-10-03 under a 40-way CPU
+        //     load it failed 2 of 6 runs (`18.985 ms >= 9 ms`, window 4 ms),
+        //     while the same load on the retry form below was 6/6 green.
+        //   * the tick defect cannot produce a *single* clean sample on any
+        //     host, however idle: no trial can land closer to the deadline than
+        //     the tick it is quantised to. So retrying cannot rescue a real
+        //     defect — it only stops machine load from failing an honest one.
+        //
+        // The assertion stays **per window** on purpose: a global minimum would
+        // let window 0's instantly-returning sample mask a regression affecting
+        // windows 1..5, which is exactly the regression this test is for.
+        const MAX_TRIALS: u32 = 20;
+        const CLEAN: Duration = Duration::from_millis(5);
+        let mut samples: Vec<(u32, Duration)> = Vec::new();
+
         for window_ms in [0u32, 1, 2, 4, 5] {
             let window = abort_window(window_ms);
             let mut best = Duration::MAX;
             let mut trials = String::new();
+            let mut attempts = 0u32;
+            let mut proven = false;
 
-            for trial in 0..3 {
+            while attempts < MAX_TRIALS && !proven {
+                attempts += 1;
                 let started = Instant::now();
                 let deadline = started + window;
                 let mut polls = 0u32;
@@ -3774,31 +3942,41 @@ mod tests {
                 if effective < best {
                     best = effective;
                 }
-                if trial > 0 {
+                samples.push((window_ms, effective));
+                if attempts > 1 {
                     trials.push_str(", ");
                 }
                 trials.push_str(&format!("{:.3}ms/{polls}p", effective.as_secs_f64() * 1000.0));
+                if effective < window + CLEAN {
+                    proven = true;
+                }
             }
 
             println!(
-                "abort window {window_ms} ms -> best effective {:.3} ms ({trials})",
+                "abort window {window_ms} ms -> best effective {:.3} ms in {attempts}/\
+                 {MAX_TRIALS} trial(s) ({trials})",
                 best.as_secs_f64() * 1000.0
             );
 
-            // Never early: the cancel is only requested once the deadline passed.
             assert!(
-                best >= window,
-                "window {window_ms} ms was cut short: {best:?} < {window:?}"
+                proven,
+                "window {window_ms} ms was NOT honoured in {MAX_TRIALS} trials: best {best:?}, \
+                 which is {:?} over the deadline. Every trial overshooting by more than {CLEAN:?} \
+                 is what a tick-granular wait does — on the Windows host windows 1..5 all landed \
+                 at ~11.7 ms — so the truncation point is coming from the host, not the window",
+                best.saturating_sub(window)
             );
-            // Never late by anything like a tick. The bound is deliberately well
-            // under the ~15.6 ms a tick-granular wait costs, and well over the
-            // microseconds this loop needs, so it discriminates without flaking.
-            let bound = window + Duration::from_millis(5);
-            assert!(
-                best < bound,
-                "window {window_ms} ms was NOT honoured: reached {best:?}, bound {bound:?} — the \
-                 truncation point came from the host, not from the window"
-            );
+
+            // Never early: this half is a hard invariant of the loop and needs
+            // no load tolerance — the cancel is only requested once the
+            // deadline has passed, so no amount of load can make a sample short.
+            for (ms, effective) in samples.iter().filter(|(ms, _)| *ms == window_ms) {
+                assert!(
+                    *effective >= abort_window(*ms),
+                    "window {ms} ms was cut short: {effective:?} < {:?}",
+                    abort_window(*ms)
+                );
+            }
         }
     }
 
@@ -4096,7 +4274,10 @@ mod tests {
                 "code {code}: nothing was submitted, libusb owns nothing"
             );
             assert!(!r.one_line().contains("UNREAPED"), "{}", r.one_line());
-            assert!(r.one_line().ends_with("SUBMICRO"), "{}", r.one_line());
+            assert!(r.one_line().contains("SUBMICRO"), "{}", r.one_line());
+            // Instrument fix 2: a never-submitted 0 is construction-true but still not a wire
+            // measurement, and the row carries the marker rather than passing the 0 off as one.
+            assert!(r.one_line().contains("XFER-UNMEASURED"), "{}", r.one_line());
         }
     }
 
@@ -4173,7 +4354,7 @@ mod tests {
             4,
         );
         assert!(lost.unreaped(), "{}", lost.one_line());
-        assert!(lost.one_line().ends_with("UNREAPED"), "{}", lost.one_line());
+        assert!(lost.one_line().contains("UNREAPED"), "{}", lost.one_line());
         assert_eq!(lost.abort_after_ms, Some(4));
     }
 
@@ -4263,7 +4444,7 @@ mod tests {
         }
     }
 
-    const LIVE: &str = "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:00112233445566AA \
+    const LIVE: &str = "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:[REDACTED-IDENTITY] \
                         IBFL:1C SRTG:[IBOOT-2234.0.0.2.22]";
 
     /// The device node is identified by its descriptor, not by "the first Apple
@@ -4280,7 +4461,7 @@ mod tests {
             ),
             node(
                 "USB\\VID_05AC&PID_1227\\CPID:8003_CPRV:01_CPFM:03_SCEP:01_BDID:02_\
-                 ECID:00112233445566AA_IBFL:1C_SRTG:[IBOOT-2234.0.0.2.22]",
+                 ECID:[REDACTED-IDENTITY]_IBFL:1C_SRTG:[IBOOT-2234.0.0.2.22]",
                 "USB\\VID_05AC&PID_1227&REV_0100",
                 "libusbK",
             ),
@@ -5156,10 +5337,56 @@ mod tests {
         }
     }
 
+    /// The device node is found by the **same key libusb uses** — sysfs
+    /// `busnum`/`devnum`, which libusb reads into `bus_number` /
+    /// `device_address` (`linux_usbfs.c:624-636`, `:919-920`) — never by
+    /// enumeration order, name, or "the first Apple-looking node". Ambiguity is
+    /// refused, not resolved by taking the first match.
+    #[test]
+    #[cfg(unix)]
+    fn sysfs_lookup_is_keyed_by_bus_devnum_not_position() {
+        let f = Fixture::new("lookup");
+        // Deliberately out of order: another vendor's node listed first, and
+        // an Apple-PID node on a different address.
+        f.device("1-10", "8087", "0026", 1, 2, Some("btusb"), Some("usb"));
+        f.device("1-9", "05ac", "1227", 1, 9, None, None);
+        f.device("1-4", "05ac", "1227", 1, 7, None, Some("apple-mfi-fastcharge"));
+
+        let m = measure_sysfs_driver(f.root(), 1, 7).expect("the target node must be found");
+        assert_eq!(m.device.name, "1-4", "found by bus/address, not by order");
+        assert_eq!((m.device.bus, m.device.address), (1, 7));
+        assert_eq!((m.device.id_vendor, m.device.id_product), (APPLE_VID, DFU_MODE_PID));
+        assert_eq!(m.interface0.dir, "1-4:1.0");
+        assert_eq!(m.interface0.driver, None, "no driver link is a measurement");
+        assert_eq!(m.service, "usbfs");
+        assert_eq!(m.device_driver, Ok(Some("apple-mfi-fastcharge".to_string())));
+
+        // The *other* 05AC:1227 device is measured too, and is not confused
+        // with ours.
+        let other = measure_sysfs_driver(f.root(), 1, 9).expect("the second target node");
+        assert_eq!(other.device.name, "1-9");
+        assert_eq!(other.interface0.dir, "1-9:1.0");
+
+        // Wrong bus/address: a failed measurement with a reason, never the
+        // nearest node.
+        let e = measure_sysfs_driver(f.root(), 2, 7).unwrap_err();
+        assert!(e.contains("no sysfs device node"), "{e}");
+        assert!(e.contains("busnum 2 devnum 7"), "{e}");
+
+        // Two nodes claiming one bus/address cannot be told apart: refuse
+        // rather than take the first.
+        let dup = Fixture::new("dupaddr");
+        dup.device("1-4", "05ac", "1227", 1, 7, None, None);
+        dup.device("1-9", "05ac", "1227", 1, 7, None, None);
+        let e = measure_sysfs_driver(dup.root(), 1, 7).unwrap_err();
+        assert!(e.contains("refusing to pick one"), "{e}");
+        assert!(e.contains("1-4") && e.contains("1-9"), "{e}");
+    }
+
     /// **The measurement this task exists for.** Interface 0 with no `driver`
     /// link is `usbfs` — a real answer — and with interface 0 claimed the
-    /// capability is `Real`, with the evidence naming the three measurements
-    /// that produced it.
+    /// capability is `Real`, with the evidence naming the two measurements and
+    /// the one source inspection that produced it.
     #[test]
     #[cfg(unix)]
     fn sysfs_no_driver_link_reports_usbfs_and_real_with_its_evidence() {
@@ -5199,9 +5426,23 @@ mod tests {
             "a fixture root must never masquerade as /sys: {}",
             reading.capability_note
         );
-        // The exact string `main.rs:179` prints. "other" would be a class that
+        // The exact string `main.rs:179` prints, through the classifier
+        // `open_this` actually uses on Linux. "other" would be a class that
         // names nothing; "unknown" is the defect this task removes.
+        assert_eq!(linux_driver_class(&reading).as_str(), "usbfs");
         assert_eq!(DriverClass::from_service(&reading.service).as_str(), "usbfs");
+        // And Real's sentence labels its cited source INSPECTED, never as a
+        // fourth measurement (LINUX-HANDOFF rule 3).
+        assert!(
+            reading.capability_note.contains("INSPECTED"),
+            "{}",
+            reading.capability_note
+        );
+        assert!(
+            !reading.capability_note.contains("from three measurements"),
+            "{}",
+            reading.capability_note
+        );
     }
 
     /// A `usbfs` driver link is the same answer by the other route: a userspace
@@ -5244,11 +5485,16 @@ mod tests {
         );
     }
 
-    /// The negative control for the whole rule: an absent or unreadable sysfs
-    /// root is `Unknown` **with the reason**, never a guess in either direction.
+    /// The negative control for the whole rule: an absent root — and a second
+    /// failure, a *file* where the device tree should be — is `Unknown` **with
+    /// the reason**, never a guess in either direction. A real EACCES on an
+    /// attribute is a third failure and has its own test,
+    /// `sysfs_unreadable_attributes_are_not_reported_as_absent`; before that
+    /// test existed, a mutation folding "cannot read" into "not there" left the
+    /// whole suite green.
     #[test]
     #[cfg(unix)]
-    fn sysfs_absent_or_unreadable_root_is_unknown_with_the_reason() {
+    fn sysfs_absent_or_not_a_directory_root_is_unknown_with_the_reason() {
         let f = Fixture::new("badroot");
         let missing = f.root().join("no-such-tree");
         let e_missing = measure_sysfs_driver(&missing, 1, 7).unwrap_err();
@@ -5332,8 +5578,16 @@ mod tests {
         assert!(e_dangling.contains("dangling driver link"), "{e_dangling}");
         assert_ne!(e_non_usb, e_dangling, "four problems, four messages");
 
-        // Neither failure may be read as "no kernel driver bound".
-        for e in [e_non_usb, e_dangling] {
+        // A regular file named `driver` is not a driver binding either: sysfs
+        // creates a symlink or nothing at all.
+        let f3 = Fixture::new("filelink");
+        f3.device("1-4", "05ac", "1227", 1, 7, None, None);
+        f3.write("bus/usb/devices/1-4/1-4:1.0/driver", "usbfs\n");
+        let e_file = measure_sysfs_driver(f3.root(), 1, 7).unwrap_err();
+        assert!(e_file.contains("not a symlink"), "{e_file}");
+
+        // None of the three may be read as "no kernel driver bound".
+        for e in [e_non_usb, e_dangling, e_file] {
             let reading = linux_driver_reading(Err(e), true);
             assert_ne!(reading.service, "usbfs");
             assert_eq!(reading.service, "");
@@ -5422,6 +5676,14 @@ mod tests {
         let err_e = resolve_interface0(e.root(), &only_node(e.root())).unwrap_err();
         assert!(err_e.contains("no interface 0 directory"), "{err_e}");
         assert!(err_e.contains("1 interface directory"), "{err_e}");
+
+        // (f) a directory NAMED `:1.0` whose bInterfaceNumber says 1 is not
+        //     interface 0: the name is confirmed, never trusted.
+        let g = Fixture::new("iface-lying");
+        g.dfu_device();
+        g.write("bus/usb/devices/1-4/1-4:1.0/bInterfaceNumber", "01\n");
+        let err_g = resolve_interface0(g.root(), &only_node(g.root())).unwrap_err();
+        assert!(err_g.contains("no interface 0 directory"), "{err_g}");
     }
 
     /// Attribute parsing, whole domain: sysfs's exact formats accepted, every
@@ -5462,9 +5724,10 @@ mod tests {
     #[cfg(unix)]
     fn linux_capability_pins_the_whole_domain() {
         // (what, service the fixture measures or the reason it fails, claimed,
-        // expected capability)
+        // expected capability) — every outcome with BOTH claim states, so no
+        // cell of the domain is untested.
         #[allow(clippy::type_complexity)]
-        let cases: [(&str, Result<&str, &str>, bool, ResetCapability); 8] = [
+        let cases: [(&str, Result<&str, &str>, bool, ResetCapability); 10] = [
             ("usbfs link, claimed", Ok("usbfs"), true, ResetCapability::Real),
             ("no driver link, claimed", Ok("none"), true, ResetCapability::Real),
             ("usbfs link, unclaimed", Ok("usbfs"), false, ResetCapability::Unknown),
@@ -5472,13 +5735,25 @@ mod tests {
             ("kernel driver, claimed", Ok("usbhid"), true, ResetCapability::Unknown),
             ("kernel driver, unclaimed", Ok("usbhid"), false, ResetCapability::Unknown),
             (
-                "root absent",
+                "root absent, claimed",
                 Err("the sysfs device tree '/nope' could not be listed (os error 2)"),
                 true,
                 ResetCapability::Unknown,
             ),
             (
-                "interface 0 missing",
+                "root absent, unclaimed",
+                Err("the sysfs device tree '/nope' could not be listed (os error 2)"),
+                false,
+                ResetCapability::Unknown,
+            ),
+            (
+                "interface 0 missing, claimed",
+                Err("sysfs has no interface 0 directory under '/nope/1-4'"),
+                true,
+                ResetCapability::Unknown,
+            ),
+            (
+                "interface 0 missing, unclaimed",
                 Err("sysfs has no interface 0 directory under '/nope/1-4'"),
                 false,
                 ResetCapability::Unknown,
@@ -5504,8 +5779,20 @@ mod tests {
             assert_eq!(reading.capability, want, "{what}");
             assert!(!reading.capability_note.is_empty(), "{what}: evidence must never be blank");
             if want == ResetCapability::Real {
+                assert!(claimed, "{what}: no Real cell may exist with an unclaimed interface");
                 assert!(reading.capability_note.contains("REAL"), "{what}");
                 assert!(reading.capability_note.contains("USBDEVFS_RESET"), "{what}");
+                assert!(
+                    reading.capability_note.contains("INSPECTED"),
+                    "{what}: the cited backend property must be labelled INSPECTED, not \
+                     measured: {}",
+                    reading.capability_note
+                );
+                assert!(
+                    reading.capability_note.contains("claimed at open"),
+                    "{what}: Real must record the claim evidence: {}",
+                    reading.capability_note
+                );
                 assert_eq!(reading.service, "usbfs", "{what}");
             } else {
                 assert!(
@@ -5515,15 +5802,7 @@ mod tests {
                 );
                 assert!(!reading.capability_note.contains("REAL"), "{what}");
             }
-            if claimed {
-                assert!(
-                    reading.capability_note.contains("claimed at open")
-                        || want == ResetCapability::Real
-                        || reading.service != "usbfs",
-                    "{what}: a claimed usbfs path must record the claim: {}",
-                    reading.capability_note
-                );
-            } else if reading.service == "usbfs" {
+            if !claimed && reading.service == "usbfs" {
                 assert!(
                     reading.capability_note.contains("NOT claimed"),
                     "{what}: the unclaimed path must say so: {}",
@@ -5531,6 +5810,17 @@ mod tests {
                 );
             }
         }
+
+        // The table must pin the WHOLE domain: every measurement outcome with
+        // both claim states. A table that samples is how a green suite once
+        // ratified three of eleven DFU states (HANDOFF §9.3).
+        let mut domain: Vec<(String, bool)> = cases
+            .iter()
+            .map(|(_, outcome, claimed, _)| (format!("{outcome:?}"), *claimed))
+            .collect();
+        domain.sort();
+        domain.dedup();
+        assert_eq!(domain.len(), 10, "5 outcomes x 2 claim states: {domain:?}");
     }
 
     /// The Linux reset prose must never draw the Windows conclusion. The
@@ -5543,7 +5833,7 @@ mod tests {
     fn linux_reset_note_never_prints_the_windows_conclusion() {
         // The shape `linux_driver_reading` actually records for the Real case,
         // so the assertion below tests the real input, not a stub.
-        let evidence = "reset capability REAL, from three measurements: (a) sysfs reports no \
+        let evidence = "reset capability REAL, from two measurements plus one source inspection: (a) sysfs reports no \
                         kernel driver bound to interface 0; (b) interface 0 was claimed at open; \
                         (c) libusb_reset_device maps to ioctl(USBDEVFS_RESET) \
                         (linux_usbfs.c:1596)";
@@ -5677,11 +5967,13 @@ mod tests {
         assert!(over.contains("/tmp/fixture"), "{over}");
     }
 
-    /// A failing scan must not hide behind "no device": the reason for the
-    /// unreadable entry travels in the not-found message.
+    /// A failing scan must not hide behind "no device": the reason for a
+    /// malformed entry travels in the not-found message. (This test is about a
+    /// *malformed* attribute; real EACCES has its own test,
+    /// `sysfs_unreadable_attributes_are_not_reported_as_absent`.)
     #[test]
     #[cfg(unix)]
-    fn sysfs_unreadable_node_is_reported_in_the_not_found_reason() {
+    fn sysfs_malformed_node_is_reported_in_the_not_found_reason() {
         let f = Fixture::new("badattr");
         f.dfu_device();
         // `1-9` looks like a device node but its idVendor is malformed.
@@ -5720,5 +6012,129 @@ mod tests {
             ResetCapability::Unknown,
             "Usbfs must not be aliased to Real: that would bypass the measured evidence"
         );
+    }
+
+    /// **"Unreadable" is not "absent", pinned under a real EACCES.**
+    ///
+    /// The reviewer's mutation M7 — `read_attr` folding every error into
+    /// `Ok(None)`, i.e. "cannot read" becoming "not there" — left the whole
+    /// suite green before this test existed. That is the difference between
+    /// `Unknown` and a confident answer, on the one host that matters.
+    ///
+    /// If the test runs as a user that mode 000 cannot stop (root), it says so
+    /// loudly and returns rather than passing without having measured anything.
+    #[test]
+    #[cfg(unix)]
+    fn sysfs_unreadable_attributes_are_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new("eacces-vid");
+        f.dfu_device();
+        let vid = f.root().join("bus/usb/devices/1-4/idVendor");
+        std::fs::set_permissions(&vid, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&vid).is_ok() {
+            eprintln!(
+                "SKIP sysfs_unreadable_attributes_are_not_reported_as_absent: mode 000 is \
+                 readable by this user (root?); no EACCES to measure"
+            );
+            return;
+        }
+        let e_vid = measure_sysfs_driver(f.root(), 1, 7).unwrap_err();
+        assert!(e_vid.contains("could not be read"), "{e_vid}");
+        assert!(
+            e_vid.contains("Permission denied") || e_vid.contains("os error 13"),
+            "the reason must be the real one: {e_vid}"
+        );
+        assert!(e_vid.contains("idVendor"), "{e_vid}");
+        let reading = linux_driver_reading(Err(e_vid.clone()), true);
+        assert_eq!(reading.service, "", "an unreadable id must not yield a service");
+        assert_eq!(DriverClass::from_service(&reading.service), DriverClass::Unknown);
+        assert_eq!(reading.capability, ResetCapability::Unknown);
+        assert_ne!(reading.service, "usbfs", "no guess in either direction");
+
+        // The same rule one layer in: interface 0 exists, but its
+        // bInterfaceNumber cannot be read, so nothing may be reported as
+        // "no kernel driver bound" — and the message is a different one.
+        let f2 = Fixture::new("eacces-iface");
+        f2.dfu_device();
+        let bnum = f2
+            .root()
+            .join("bus/usb/devices/1-4/1-4:1.0/bInterfaceNumber");
+        std::fs::set_permissions(&bnum, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&bnum).is_ok() {
+            eprintln!(
+                "SKIP sysfs_unreadable_attributes_are_not_reported_as_absent: mode 000 is \
+                 readable by this user (root?); no EACCES to measure"
+            );
+            return;
+        }
+        let e_iface = measure_sysfs_driver(f2.root(), 1, 7).unwrap_err();
+        assert!(e_iface.contains("could not be read"), "{e_iface}");
+        assert!(
+            e_iface.contains("Permission denied") || e_iface.contains("os error 13"),
+            "the reason must be the real one: {e_iface}"
+        );
+        assert!(e_iface.contains("bInterfaceNumber"), "{e_iface}");
+        assert_ne!(
+            e_iface, e_vid,
+            "two different unreadable attributes, two different messages"
+        );
+        let reading2 = linux_driver_reading(Err(e_iface), true);
+        assert_eq!(reading2.service, "");
+        assert_eq!(reading2.capability, ResetCapability::Unknown);
+        assert_ne!(reading2.service, "usbfs");
+    }
+
+    /// The platform dispatch itself, pinned. Both reviewers found that
+    /// `reset_note_here`'s `#[cfg(unix)]` arm could be reverted to the Windows
+    /// `reset_note` with the whole suite still green — the measured defect (a
+    /// real Linux reset reported as "cannot be determined from here") could
+    /// come back silently. This calls the dispatcher, not the Linux function.
+    #[test]
+    #[cfg(unix)]
+    fn reset_note_dispatch_uses_the_linux_sentence_on_this_host() {
+        let note = reset_note_here(
+            ResetCapability::Real,
+            "reset capability REAL, from two measurements plus one source inspection: (c) \
+             INSPECTED — ioctl(USBDEVFS_RESET) (linux_usbfs.c:1596)",
+            true,
+            "usbfs",
+            sys::constants::LIBUSB_SUCCESS,
+            237_000,
+            Some(5),
+            Some(5),
+        );
+        assert!(note.contains("linux_usbfs.c"), "{note}");
+        assert!(!note.contains("windows_winusb.c"), "{note}");
+        assert!(!note.contains("cannot be determined from here"), "{note}");
+        assert!(note.contains("UNVERIFIED"), "{note}");
+    }
+
+    /// The driver line and the capability line are classified from one **exact**
+    /// measurement. The reviewer's `usbfs-something-kernel` fixture produced
+    /// `driver service: usbfs` next to `reset: unknown` under the substring rule
+    /// `DriverClass::from_service` uses; on Linux the classification is exact,
+    /// so the two lines cannot disagree.
+    #[test]
+    #[cfg(unix)]
+    fn linux_driver_class_is_exact_about_usbfs() {
+        let cases = [
+            ("usbfs", "usbfs", ResetCapability::Real),
+            ("usbfs-kernel", "other", ResetCapability::Unknown),
+            ("usbfsfoo", "other", ResetCapability::Unknown),
+            ("usbhid", "other", ResetCapability::Unknown),
+        ];
+        for (service, want_class, want_cap) in cases {
+            let f = Fixture::new(&format!("class-{service}"));
+            f.device("1-4", "05ac", "1227", 1, 7, Some(service), None);
+            let reading = linux_driver_reading(measure_sysfs_driver(f.root(), 1, 7), true);
+            assert_eq!(linux_driver_class(&reading).as_str(), want_class, "{service}");
+            assert_eq!(reading.capability, want_cap, "{service}");
+            assert_eq!(
+                linux_driver_class(&reading).as_str() == "usbfs",
+                reading.capability == ResetCapability::Real,
+                "{service}: the ident driver line and the ident reset line must agree"
+            );
+        }
     }
 }

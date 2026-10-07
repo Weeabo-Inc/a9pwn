@@ -33,15 +33,57 @@ fn usage() {
            reset       bare port reset, reporting what it actually did\n\
            plan        build the payload and print every field; send NOTHING\n\
            selftest    offline checks: blob hashes, struct sizes, config table\n\
+           readwindow  read SRAM through the resident handler; no DNLOAD, no mailbox\n\
            run         THE EXPLOIT. Writes to the device.\n\
          \n\
+         READWINDOW — needs a pwn made with `--handler readwindow` (see OPTIONS)\n\
+           a9pwn readwindow ADDR:LEN [--expect-file F [--image-base A]] [--dry-run] [--json]\n\
+           ONE request: bmRequestType 0xA1, bRequest 0x2, wValue 0xFFFF (the ONLY wValue\n\
+           MEASURED to reach a handler), wIndex = window index ((ADDR - 0x180000000) >> 12,\n\
+           index 1..=0x3FF), wLength = LEN. The reply is LEN bytes of SRAM, reported AS\n\
+           MEMORY (no DONE_MAGIC is demanded). It sends no DNLOAD and, with the readwindow\n\
+           handler resident, never touches the command mailbox: the handler checks wValue,\n\
+           then wIndex, and branches to the read arm without loading [mailbox], so a stale\n\
+           EXEC_MAGIC in the buffer cannot be executed by a read. It therefore works with\n\
+           an image staged at 0x180380000. The handler bounds the window inside mapped\n\
+           SRAM; the host refuses first, so a bad argument costs no transfer. The stock\n\
+           command form (wValue 0xFFFF, wIndex 0) is preserved word for word.\n\
+           HAZARD: with the STOCK handler resident this same request is not a read - the\n\
+           stock arm loads the mailbox magic, so a stale EXEC_MAGIC there is a wild execute.\n\
+           Reachable is not the same as safe; see a9boot/HANDLER-RELOCATION.md 6.\n\
+           --new-brequest uses the A1/0x1F form (MEASURED filtered) for the record only.\n\
+         \n\
          OPTIONS\n\
+           --handler stock|readwindow  which resident handler `run` installs (default stock).\n\
+           `readwindow` must be installed by a pwn before the command can answer.\n\
+           --expect-file F            compare the reply against F at ADDR - --image-base\n\
+           --expect-offset N          compare at this file offset instead\n\
+           --image-base A             where F starts in SRAM (default 0x180380000)\n\
+           --expect-state N           require this DFU state from the ROM's own GET_STATUS\n\
+           --new-brequest             use the A1/0x1F form (MEASURED filtered); default is the routed form\n\
+           --probe-shape              send ONLY the safe handler-shape probe and exit. It never uses\n\
+           wValue 0xFFFF, so no handler can load [mailbox] for it; an all-zero reply means the OLD\n\
+           handler is resident and the routed read must NOT be sent.\n\
+           --ack-routed-handler       REQUIRED for a live read: the routed read's wValue 0xFFFF is\n\
+           the value that arms the stock data-driven path, so it is only safe while THIS handler\n\
+           is resident. No wire request can verify that (the only hook instrument is the read\n\
+           itself); the install line `PATCH blob : handler=readwindow … sha256 …` is the evidence,\n\
+           and this flag is the operator's assertion. Stale handler + routed read = wild execute.
+           --unsafe-shape-unknown     let --shape-first continue on a SHAPE_UNKNOWN probe (fix 3).
+           Deliberately unsafe: an unknown handler + routed read is the wild-execute path.\n\
+           --json                     one-line JSON transcript instead of prose\n\
            --rounds N                 max stage rounds (default 64)\n\
            --dry-run                  build everything, send nothing\n\
            --verbose | -v             per-transfer lines\n\
            --trace FILE               JSONL event log\n\
            --stage reset|setup|spray|patch   run one stage only\n\
            --allow-winusb             proceed even though resets are no-ops\n\
+           --force                    run the exploit even if the serial descriptor already\n\
+           carries PWND:[checkm8]. Without it a marker left by an earlier pwn\n\
+           makes `run` send NOTHING (transfers=0), and the verdict now refuses\n\
+           [PWNED] in exactly that case (rule 14, RUNG2-EVIDENCE.md 6.0p).\n\
+           Needed to re-pwn while an image is held in the DFU buffer: the only\n\
+           other way to clear the marker, a Power+Home re-entry, destroys it.\n\
            --leak-windex N | --leak-windex-ipwndfu   spray leak wIndex: N (decimal or 0x hex,\n\
            default 0x0A = gaster.c:52), or 0x00 for the ipwndfu lineage — a probe,\n\
            not a second opinion\n\
@@ -74,6 +116,63 @@ fn value(args: &[String], name: &str) -> Option<String> {
 
 fn number(args: &[String], name: &str) -> Option<u64> {
     value(args, name).and_then(|v| v.parse::<u64>().ok())
+}
+
+/// The exit code for a finished run — derived from the VERDICT first (review/04 F7): the process
+/// used to map `RunOutcome::Pwned` to 0 unconditionally, so `PWNED_UNMEASURED` — whose own
+/// headline says "this is NOT a PWNED verdict" — still exited 0 and `a9pwn run && next-step`
+/// chains proceeded on a refusal. The shell and the print disagreed about the same run. Now a
+/// `PWNED_*` refusal verdict is `EXIT_PREFLIGHT_REFUSED` whatever the outcome, and only a real
+/// [`verdict::PWNED`] exits 0 from that family; everything else keeps the outcome mapping.
+fn exit_for(outcome: &RunOutcome, verdict_code: &str) -> ExitCode {
+    match verdict_code {
+        verdict::PWNED => return ExitCode::from(EXIT_OK),
+        verdict::PWNED_UNMEASURED
+        | verdict::PWNED_UNCONFIRMED
+        | verdict::PWNED_MARKER_PREEXISTING => return ExitCode::from(EXIT_PREFLIGHT_REFUSED),
+        _ => {}
+    }
+    match outcome {
+        RunOutcome::Pwned => ExitCode::from(EXIT_OK),
+        RunOutcome::NoDevice => ExitCode::from(EXIT_NO_DEVICE),
+        RunOutcome::Unsupported(_) => ExitCode::from(EXIT_UNSUPPORTED),
+        RunOutcome::Exhausted { .. } => ExitCode::from(EXIT_EXHAUSTED),
+        RunOutcome::Aborted(_) => ExitCode::from(EXIT_TRANSPORT),
+    }
+}
+
+#[cfg(test)]
+mod exit_for_tests {
+    use super::*;
+
+    /// **The firing control for F7**: a refusal verdict never exits 0, whatever the outcome
+    /// says — and the mutation gate is the old mapping (`RunOutcome::Pwned` alone → 0), which
+    /// these two cases are exactly the shape of.
+    #[test]
+    fn control_a_pwned_refusal_verdict_never_exits_zero() {
+        assert_eq!(exit_for(&RunOutcome::Pwned, verdict::PWNED), ExitCode::from(EXIT_OK));
+        assert_eq!(
+            exit_for(&RunOutcome::Pwned, verdict::PWNED_UNMEASURED),
+            ExitCode::from(EXIT_PREFLIGHT_REFUSED)
+        );
+        assert_eq!(
+            exit_for(&RunOutcome::Pwned, verdict::PWNED_MARKER_PREEXISTING),
+            ExitCode::from(EXIT_PREFLIGHT_REFUSED)
+        );
+        assert_eq!(
+            exit_for(&RunOutcome::Pwned, verdict::PWNED_UNCONFIRMED),
+            ExitCode::from(EXIT_PREFLIGHT_REFUSED)
+        );
+        // Non-PWNED verdicts keep the outcome mapping.
+        assert_eq!(
+            exit_for(&RunOutcome::NoDevice, verdict::DEVICE_ABSENT),
+            ExitCode::from(EXIT_NO_DEVICE)
+        );
+        assert_eq!(
+            exit_for(&RunOutcome::Exhausted { rounds: 1 }, verdict::EXHAUSTED_UNKNOWN),
+            ExitCode::from(EXIT_EXHAUSTED)
+        );
+    }
 }
 
 /// gaster's own defaults (gaster.c:1631-1638).
@@ -128,6 +227,20 @@ fn build_options(args: &[String]) -> Result<RunOptions, String> {
         .unwrap_or_else(|| RunOptions::default().pad_timeout_ms as u64)
         as u32;
 
+    // Which resident handler the PATCH install places. The default is gaster's, byte for byte;
+    // `readwindow` installs the in-tree handler that adds the mailbox-free SRAM read. A name that
+    // is neither is refused rather than defaulted, because a wrong handler is a payload that
+    // behaves differently while looking identical in every other field.
+    let handler = match value(args, "--handler").as_deref() {
+        None | Some("stock") => payload::HandlerVariant::Stock,
+        Some("readwindow") => payload::HandlerVariant::ReadWindow,
+        Some(other) => {
+            return Err(format!(
+                "--handler {other:?} is not one of stock|readwindow (payload::HandlerVariant)"
+            ))
+        }
+    };
+
     let opts = RunOptions {
         max_rounds: number(args, "--rounds").unwrap_or(64) as u32,
         usb_timeout_ms: number(args, "--usb-timeout-ms").unwrap_or(USB_TIMEOUT_MS as u64) as u32,
@@ -145,8 +258,18 @@ fn build_options(args: &[String]) -> Result<RunOptions, String> {
             max_millis: 600_000,
         },
         stop_after_setup_stall: flag(args, "--stop-after-setup-stall"),
+        // Rule 14 (`RUNG2-EVIDENCE.md` §6.0p). Without this the stage logic treats a
+        // marker left by an earlier pwn as "the payload is already resident", sends
+        // nothing, and produces `transfers=0`. `--force` runs the exploit anyway,
+        // which is what re-pwning while an image is held in the DFU buffer needs: a
+        // Power+Home re-entry (the only other way to clear the marker) destroys that
+        // image. The bar for the flag is deliberately high — it writes to the device
+        // on a device that already reports pwned.
+        force: flag(args, "--force"),
         probe_setup_state: flag(args, "--probe-setup-state"),
         settle_ms: number(args, "--settle-ms").unwrap_or(0) as u32,
+        handler,
+        mailbox_relocated: flag(args, "--mailbox-relocated"),
     };
     if opts.usb_timeout_ms < 1 {
         return Err("--usb-timeout-ms must be >= 1".to_string());
@@ -299,8 +422,24 @@ fn main() -> ExitCode {
             println!("  insecure_base : 0x{:X}", cfg.insecure_memory_base);
             println!();
 
-            match payload::build_payload(&cfg, kind) {
+            let plan_handler = match value(&args, "--handler").as_deref() {
+                None | Some("stock") => payload::HandlerVariant::Stock,
+                Some("readwindow") => payload::HandlerVariant::ReadWindow,
+                Some(other) => {
+                    println!("  --handler {other:?} is not one of stock|readwindow");
+                    return ExitCode::from(EXIT_BAD_ARGS);
+                }
+            };
+            let plan_mailbox = if flag(&args, "--mailbox-relocated") {
+                a9pwn::config::S1_MAILBOX_BASE
+            } else {
+                cfg.insecure_memory_base
+            };
+            match payload::build_payload_variant(&cfg, kind, plan_handler, plan_mailbox) {
                 Ok(built) => {
+                    println!("  handler       : {}", built.handler.name());
+                    println!("  payload_dest  : 0x{:X}", built.payload_dest);
+                    println!("  payload_sz    : {} bytes", built.payload_sz);
                     println!("  payload       : {} bytes", built.blob.len());
                     println!("  overwrite     : {} bytes", built.overwrite.len());
                     println!("  blob sha256   : {}", built.blob_sha256);
@@ -319,6 +458,352 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::from(EXIT_OK)
+        }
+
+        // ----------------------------------------------------------- readwindow
+        //
+        // The one request that can read SRAM while the DFU buffer holds a staged image: no DNLOAD
+        // (which DFU state 5 consumes as image data) and no mailbox (which an image overwrites,
+        // and which the stock `0xFFFF` arm *executes* — see a9boot/HANDLER-RELOCATION.md §6).
+        "readwindow" => {
+            use a9pwn::readwindow as rw;
+
+            let arm = match rw::vendored_arm() {
+                Ok(a) => a,
+                Err(e) => {
+                    println!("a9pwn readwindow: the vendored handler does not decode: {e}");
+                    return ExitCode::from(EXIT_TRANSPORT);
+                }
+            };
+
+            // PROBE-ONLY MODE. Safe on every handler (it never uses wValue 0xFFFF), so it needs
+            // no acknowledgement and can be the first thing sent to a device whose handler is
+            // unknown. Run before every routed read, or alone when the handler is in doubt.
+            let json = flag(&args, "--json");
+            let probe_only = flag(&args, "--probe-shape")
+                && args.get(1).filter(|s| !s.starts_with("--")).is_none();
+            if probe_only {
+                let mut t = match Transport::open_first_dfu() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("  no DFU device: {e}");
+                        return ExitCode::from(EXIT_NO_DEVICE);
+                    }
+                };
+                let _ = t.identity();
+                let timeout_ms = number(&args, "--timeout-ms").unwrap_or(1000).max(1) as u32;
+                let probe = rw::shape_probe_request(0x40);
+                let mut buf = vec![0u8; 0x40];
+                let pr = t.control(probe, &mut buf, timeout_ms);
+                let n = pr.transferred.min(buf.len());
+                let (code, why) = rw::classify_shape(&buf[..n]);
+                if json {
+                    println!(
+                        "{{\"tool\":\"a9pwn\",\"command\":\"handler-shape\",\"setup\":\"{}\",\
+                         \"transferred\":{},\"transport\":\"{:?}\",\"result\":\"{code}\",\
+                         \"detail\":\"{}\"}}",
+                        rw::setup_fields(&probe),
+                        n,
+                        pr.status,
+                        why.replace('"', "\\\"")
+                    );
+                } else {
+                    println!("a9pwn handler-shape probe — safe on every handler (wValue {:#06x}, never 0xFFFF)", probe.value);
+                    println!("  SETUP         : {}", rw::setup_fields(&probe));
+                    println!("  readback      : {} byte(s), transport {:?}, {} us", n, pr.status, pr.micros);
+                    println!("  RESULT        : {code}");
+                    println!("  detail        : {why}");
+                }
+                return match code {
+                    rw::SHAPE_OLD_HANDLER => ExitCode::from(EXIT_PREFLIGHT_REFUSED),
+                    rw::SHAPE_UNKNOWN => ExitCode::from(EXIT_TRANSPORT),
+                    _ => ExitCode::from(EXIT_OK),
+                };
+            }
+
+            let spec = match args.get(1).filter(|s| !s.starts_with("--")) {
+                Some(s) => s.clone(),
+                None => {
+                    eprintln!(
+                        "a9pwn: readwindow needs ADDR:LEN (e.g. 0x180384000:0x1000). \
+                         `a9pwn --help` for the request it sends."
+                    );
+                    return ExitCode::from(EXIT_BAD_ARGS);
+                }
+            };
+            let (addr, len) = match rw::parse_window(&spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("a9pwn: {e}");
+                    return ExitCode::from(EXIT_BAD_ARGS);
+                }
+            };
+
+            let dry = flag(&args, "--dry-run");
+            let timeout_ms = number(&args, "--timeout-ms").unwrap_or(1000).max(1) as u32;
+            let expect_state = number(&args, "--expect-state").map(|v| v as u8);
+            let expect_file = value(&args, "--expect-file");
+            let image_base = number(&args, "--image-base").unwrap_or(0x1803_8000);
+            let expect_offset = number(&args, "--expect-offset");
+
+            // Step 1: the request, or a refusal by name. **Nothing is sent on a refusal**, so a
+            // bad argument costs no transfer at all. The handler holds the same bound on its side;
+            // this is the host half of a bound that must exist in both places.
+            let new_brequest = flag(&args, "--new-brequest");
+            let build = |a: &rw::ReadArm| -> Result<CtrlReq, String> {
+                if new_brequest {
+                    rw::read_window_request_newcode(a, addr, len)
+                } else {
+                    rw::read_window_request(a, addr, len)
+                }
+            };
+            if let Err(e) = build(&arm) {
+                if json {
+                    println!(
+                        "{{\"tool\":\"a9pwn\",\"command\":\"readwindow\",\"addr\":\"{addr:#x}\",\
+                         \"len\":{len},\"result\":\"REFUSED\",\"detail\":\"{}\"}}",
+                        e.replace('"', "\\\"")
+                    );
+                } else {
+                    println!("a9pwn readwindow — REFUSED before any transfer");
+                    println!("  {e}");
+                    println!("  nothing was sent; the device was not opened");
+                }
+                return ExitCode::from(EXIT_PREFLIGHT_REFUSED);
+            }
+            let request = build(&arm).expect("checked above");
+
+            if dry {
+                if json {
+                    let out = rw::ReadOutcome {
+                        addr,
+                        len,
+                        request,
+                        state_before: None,
+                        refused: None,
+                        code: rw::PLANNED.to_string(),
+                        bytes: Vec::new(),
+                        transferred: 0,
+                        transferred_known: true,
+                        prefix_unverified: Vec::new(),
+                        micros: 0,
+                        transport: "NOT_SENT".to_string(),
+                    };
+                    println!("{}", rw::json_line(&out, Some(&arm)));
+                } else {
+                    println!("a9pwn readwindow (DRY RUN - nothing will be sent)");
+                    println!(
+                        "  window        : {addr:#x}+{len:#x}  (index {:#x}, source {:#x})",
+                        request.index,
+                        arm.base + ((request.index as u64) << arm.granule_shift)
+                    );
+                    println!("  SETUP         : {}", rw::setup_fields(&request));
+                    println!(
+                        "  preflight     : then one ROM DFU_GET_STATUS (0xA1/0x03, 6 bytes); \
+                         {}",
+                        match expect_state {
+                            Some(s) => format!("--expect-state {s} enforced"),
+                            None => "the state is reported, not gated (rule 13)".to_string(),
+                        }
+                    );
+                    println!(
+                        "  handler       : readwindow, {} bytes, sha256 {}",
+                        payload::READWINDOW_BLOB_LEN,
+                        payload::READWINDOW_BLOB_SHA256
+                    );
+                    println!(
+                        "  requires      : a pwn made with `--handler readwindow` \
+                         (payload_dest 0x{:X})",
+                        a9pwn::config::A9_8003.boot_tramp_end
+                            - (payload::READWINDOW_CODE_LEN
+                                + payload::HANDLE_CHECKM8_STRUCT_SIZE)
+                                as u64
+                    );
+                    println!("  sends         : NOTHING");
+                }
+                return ExitCode::from(EXIT_OK);
+            }
+
+            // The enforcement the doc could not provide: the routed read is only safe while THIS
+            // handler is resident, no wire request can verify that, and a stale handler turns
+            // `wValue 0xFFFF` into the stock data-driven arm. So a live read is a deliberate act.
+            if !flag(&args, "--ack-routed-handler") {
+                eprintln!(
+                    "a9pwn: refusing a LIVE routed read without --ack-routed-handler.\n\
+                     \n\
+                     Why: this read uses wValue 0xFFFF, the one routed value — and also the value\n\
+                     that sends the STOCK handler (and the OLD wValue=index read-window handler)\n\
+                     into their legacy path, where [mailbox] is loaded and a stale EXEC_MAGIC is a\n\
+                     WILD EXECUTE. That is the accident of round 6, reproduced in analysis tonight\n\
+                     (round 31's handler + this client).\n\
+                     \n\
+                     Verify first, then assert:\n\
+                     a9pwn readwindow ADDR:LEN --probe-shape     # safe on EVERY handler, no [mailbox] load\n\
+                     a9pwn run --handler readwindow --force      # prints: PATCH blob : handler=readwindow … sha256 …\n\
+                     a9pwn readwindow ADDR:LEN --ack-routed-handler\n\
+                     \n\
+                     a9boot/HANDLER-RELOCATION.md 4.1 and 6 state the limit in full."
+                );
+                return ExitCode::from(EXIT_BAD_ARGS);
+            }
+
+            let mut t = match Transport::open_first_dfu() {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("  no DFU device: {e}");
+                    return ExitCode::from(EXIT_NO_DEVICE);
+                }
+            };
+            let id = t.identity();
+
+            // Optional, and safe: run the shape probe first in the SAME invocation, so the
+            // operator's assertion is checked against the wire rather than taken on faith.
+            if flag(&args, "--probe-shape") || flag(&args, "--shape-first") {
+                let probe = rw::shape_probe_request(0x40);
+                let mut buf = vec![0u8; 0x40];
+                let pr = t.control(probe, &mut buf, timeout_ms);
+                let n = pr.transferred.min(buf.len());
+                let (code, why) = rw::classify_shape(&buf[..n]);
+                println!("  shape probe   : {}", rw::setup_fields(&probe));
+                println!("  shape result  : {} ({} byte(s), transport {:?})", code, n, pr.status);
+                println!("  shape detail  : {why}");
+                // INSTRUMENT FIX 3 (review/04 F4): SHAPE_UNKNOWN used to fall through and SEND the
+                // hazardous routed read — exactly when the probe had no information about which
+                // handler is resident. Now only a positive SHAPE_ROUTED_OR_STOCK authorises it;
+                // --unsafe-shape-unknown is the operator's explicit, deliberately unsafe override.
+                if let Err(gate) = rw::shape_gate(code, flag(&args, "--unsafe-shape-unknown")) {
+                    println!("  ABORT         : {gate}");
+                    return ExitCode::from(EXIT_PREFLIGHT_REFUSED);
+                }
+                if code == rw::SHAPE_UNKNOWN {
+                    println!(
+                        "  WARNING       : proceeding on --unsafe-shape-unknown: the probe made no \
+                         statement about the resident handler, and the routed read is being sent \
+                         anyway on the operator's explicit override."
+                    );
+                }
+            }
+
+            if !json {
+                println!("a9pwn readwindow — LIVE: one read through the resident handler");
+                println!("  device        : {}", a9pwn::trace::redact_ecid(&id.serial));
+                println!(
+                    "  window        : {addr:#x}+{len:#x}  (index {:#x}, source {:#x})",
+                    request.index,
+                    arm.base + ((request.index as u64) << arm.granule_shift)
+                );
+                println!("  SETUP         : {}", rw::setup_fields(&request));
+                println!("  sends         : this request only — no DNLOAD, no mailbox write");
+                println!();
+            }
+
+            let out = rw::run(&mut t, &arm, addr, len, timeout_ms, expect_state, false);
+
+            // Step 3: the reply as memory, and — if the operator supplied a file — a machine
+            // decision on whether this window is that file's bytes.
+            let mut verdict = out.code.clone();
+            let mut compared: Option<String> = None;
+            if out.ok() {
+                if let Some(path) = &expect_file {
+                    match std::fs::read(path) {
+                        Ok(file) => {
+                            let offset = match expect_offset {
+                                Some(o) => o as usize,
+                                None => match addr.checked_sub(image_base) {
+                                    Some(o) => o as usize,
+                                    None => {
+                                        println!(
+                                            "  REFUSED: {addr:#x} is below --image-base \
+                                             {image_base:#x}; there is no file offset for it"
+                                        );
+                                        return ExitCode::from(EXIT_PREFLIGHT_REFUSED);
+                                    }
+                                },
+                            };
+                            match rw::compare(&file, offset, &out.bytes) {
+                                Ok(()) => {
+                                    verdict = "MATCH".to_string();
+                                    compared = Some(format!(
+                                        "MATCH: all {} byte(s) equal {path} at file offset \
+                                         {offset:#x}",
+                                        out.bytes.len()
+                                    ));
+                                }
+                                Err(e) => {
+                                    verdict = "MISMATCH".to_string();
+                                    compared = Some(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            verdict = "EXPECT_FILE_UNREADABLE".to_string();
+                            compared = Some(format!(
+                                "EXPECT_FILE_UNREADABLE: {path}: {e}. No comparison was made; \
+                                 this is not a mismatch."
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if json {
+                let mut line = rw::json_line(&out, Some(&arm));
+                // The verdict and the comparison are appended by name so a shell can read them.
+                line = line.trim_end_matches('}').to_string();
+                println!(
+                    "{line},\"verdict\":\"{verdict}\",\"comparison\":{}}}",
+                    match &compared {
+                        Some(c) => format!("\"{}\"", c.replace('"', "\\\"")),
+                        None => "null".to_string(),
+                    }
+                );
+            } else {
+                println!(
+                    "  preflight     : ROM GET_STATUS state {:?} ({})",
+                    out.state_before, out.transport
+                );
+                println!(
+                    "  read          : transferred {} of {len}, transport {}, {} us",
+                    if out.transferred_known {
+                        out.transferred.to_string()
+                    } else {
+                        "UNKNOWN (no length on failure; the sync API's 0 is not a measurement)"
+                            .to_string()
+                    },
+                    out.transport,
+                    out.micros
+                );
+                if !out.prefix_unverified.is_empty() {
+                    println!(
+                        "  prefix        : {} byte(s) recovered from the buffer, LENGTH UNVERIFIED \
+                         (evidence, not memory): {}",
+                        out.prefix_unverified.len(),
+                        rw::hex_preview(&out.prefix_unverified, 48)
+                    );
+                }
+                match &out.refused {
+                    Some(e) => println!("  REFUSED       : {e}"),
+                    None => println!("  memory        : {}", rw::memory_report(&out.bytes)),
+                }
+                if let Some((v, what)) = rw::hook_in_window(addr, len, &out.bytes) {
+                    println!(
+                        "  hook          : *{:#x} = {:#x} — {what}",
+                        rw::HOOK_SLOT, v
+                    );
+                }
+                if let Some(c) = &compared {
+                    println!("  comparison    : {c}");
+                }
+                println!("  VERDICT       : {verdict}");
+            }
+
+            match verdict.as_str() {
+                "OK" | "MATCH" => ExitCode::from(EXIT_OK),
+                "MISMATCH" | "EXPECT_FILE_UNREADABLE" | "REFUSED" => {
+                    ExitCode::from(EXIT_PREFLIGHT_REFUSED)
+                }
+                _ => ExitCode::from(EXIT_TRANSPORT),
+            }
         }
 
         // ------------------------------------------------------------- selftest
@@ -377,8 +862,18 @@ fn main() -> ExitCode {
             // Preflight gate. Running the exploit with a driver whose reset is a
             // no-op cannot succeed, and failing at the end with "not pwned" would
             // accuse the exploit. Refuse up front instead.
+            //
+            // E5 item 5: the capability measured HERE, while the device is
+            // demonstrably present, is the one that counts. A later failed re-open
+            // must never overwrite it with `Unknown` — that degradation is exactly
+            // how a run which had pwned the device printed
+            // `RESET_CAPABILITY_UNKNOWN` about a device `ident` described as healthy
+            // seconds earlier (HANDOFF §4.6, LINUX-HANDOFF §4.5).
+            let mut capability_measured_while_present: Option<(a9pwn::types::DriverClass, ResetCapability)> =
+                None;
             if let Ok(t) = Transport::open_first_dfu() {
                 let cap = t.reset_capability();
+                capability_measured_while_present = Some((t.driver_class(), cap));
                 if (cap != ResetCapability::Real) && !opts.allow_winusb {
                     let id = t.identity();
                     let v = verdict::classify(
@@ -421,11 +916,59 @@ fn main() -> ExitCode {
 
             // The verdict needs the device's own identity, so re-read it. After a
             // successful pwn the serial carries PWND:[checkm8].
-            let (id, driver, cap) = match Transport::open_first_dfu() {
-                Ok(t) => (t.identity(), t.driver_class(), t.reset_capability()),
-                Err(_) => (DeviceIdentity::default(), a9pwn::types::DriverClass::Unknown,
-                           ResetCapability::Unknown),
+            //
+            // E5 items 3 and 4, both measured on this project:
+            //  * RETRY. The Windows session re-opened ONCE, ~0.7 ms after the device
+            //    had dropped and re-enumerated; the open failed, the default identity
+            //    went to the classifier, and the verdict printed `PID=0x0000
+            //    CPID=unknown PWND=absent` about a device that was in fact pwned
+            //    (HANDOFF §4.6). A pwn is followed by a re-enumeration, so the read
+            //    must wait for the device to come back rather than assume it is there.
+            //  * WALL CLOCK, not attempt count. "19 open attempts" was MEASURED to be
+            //    285-292 ms — the count is a property of our pacing, not of the device
+            //    (LINUX-HANDOFF §4.8).
+            let mut id_live: Option<DeviceIdentity> = None;
+            let mut driver_live: Option<a9pwn::types::DriverClass> = None;
+            let mut cap_live: Option<ResetCapability> = None;
+            let wait_started = Instant::now();
+            let mut attempts = 0u32;
+            while wait_started.elapsed() < Duration::from_millis(2_000) {
+                attempts += 1;
+                if let Ok(t) = Transport::open_first_dfu() {
+                    id_live = Some(t.identity());
+                    driver_live = Some(t.driver_class());
+                    cap_live = Some(t.reset_capability());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let reacquired = id_live.is_some();
+            let (id, driver, cap) = match (id_live, driver_live, cap_live) {
+                (Some(i), Some(d), Some(c)) => (i, d, c),
+                _ => {
+                    // A failed open is a missing measurement. Report it as one, and
+                    // keep the capability that was measured while the device WAS
+                    // present instead of degrading it to Unknown.
+                    let (d, c) = capability_measured_while_present
+                        .unwrap_or((a9pwn::types::DriverClass::Unknown, ResetCapability::Unknown));
+                    println!();
+                    println!(
+                        "  note: the device could not be re-opened after {attempts} attempt(s) in \
+                         {} ms; the identity below is a DEFAULT, not a reading, and the capability \
+                         is the value measured before the run ({}) rather than a degraded Unknown.",
+                        wait_started.elapsed().as_millis(),
+                        c.as_str()
+                    );
+                    (DeviceIdentity::default(), d, c)
+                }
             };
+            if reacquired {
+                println!();
+                println!(
+                    "  re-read       : live, after {attempts} open attempt(s) in {} ms",
+                    wait_started.elapsed().as_millis()
+                );
+            }
             if id.is_pwned() {
                 println!();
                 println!("  PWND marker is present in the serial descriptor.");
@@ -440,13 +983,7 @@ fn main() -> ExitCode {
             println!("    next    : {}", v.next_action);
             println!("    confidence: {:?}", v.confidence);
 
-            match outcome {
-                RunOutcome::Pwned => ExitCode::from(EXIT_OK),
-                RunOutcome::NoDevice => ExitCode::from(EXIT_NO_DEVICE),
-                RunOutcome::Unsupported(_) => ExitCode::from(EXIT_UNSUPPORTED),
-                RunOutcome::Exhausted { .. } => ExitCode::from(EXIT_EXHAUSTED),
-                RunOutcome::Aborted(_) => ExitCode::from(EXIT_TRANSPORT),
-            }
+            exit_for(&outcome, &v.code)
         }
 
         // DIAGNOSTIC, Lead-only. LINUX-HANDOFF §6 **E2**: a BARE `DFU_CLRSTATUS`,
@@ -751,4 +1288,123 @@ fn watch_presence(addr0: u8, budget_ms: u64) -> PresenceWatch {
         std::thread::sleep(Duration::from_millis(25));
     }
     w
+}
+
+#[cfg(test)]
+mod usage_dispatch {
+    //! **A usage line is not a dispatch arm.** The claim lives in the usage text and the behaviour
+    //! lives in the `match`; a command can be documented and unrunnable at the same time, and this
+    //! file already shipped that once (`readwindow` listed, `"readwindow" =>` absent).
+    //!
+    //! This is the check that would have caught it: **every command the usage text names must be
+    //! dispatchable in `main`'s match**, and the check has a firing control
+    //! (`control_a_removed_arm_is_reported`) so it cannot pass by finding nothing.
+
+    use std::collections::BTreeSet;
+
+    /// Commands named in the `COMMANDS` block of the usage string.
+    fn usage_commands(src: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let block = match (src.find("COMMANDS\\n"), src.find("OPTIONS\\n")) {
+            (Some(a), Some(b)) if a < b => &src[a..b],
+            _ => panic!("the usage text no longer has a COMMANDS..OPTIONS block to check"),
+        };
+        for line in block.lines() {
+            let line = line.trim_start_matches(' ');
+            if line.starts_with('\\') || line.is_empty() {
+                continue;
+            }
+            // `ident       read-only: ...` — the first token, then at least two spaces.
+            let name: String = line.chars().take_while(|c| c.is_ascii_lowercase() || *c == '-').collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rest = &line[name.len()..];
+            if rest.starts_with("  ") {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
+    /// Commands that are dispatch arms: `"name" =>` or `"name" | "other" =>`.
+    fn dispatch_commands(src: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for (i, _) in src.match_indices('"') {
+            let tail = &src[i + 1..];
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            if name.is_empty() || !tail[name.len()..].starts_with('"') {
+                continue;
+            }
+            // Look at the rest of the line: only `| "x"` items may precede `=>`.
+            let line_end = tail.find('\n').unwrap_or(tail.len());
+            let rest = &tail[name.len() + 1..line_end];
+            let before_arrow = rest.split("=>").next().unwrap_or("");
+            let only_alternatives = before_arrow
+                .split('|')
+                .all(|part| {
+                    let p = part.trim();
+                    p.is_empty()
+                        || (p.starts_with('"') && p.ends_with('"') && p.len() >= 2)
+                });
+            if rest.contains("=>") && only_alternatives {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
+    /// The file **before** this test module: the test module's own string literals name commands
+    /// (including in the firing control below), and scanning them would mask a deleted arm — which
+    /// is exactly how the first version of this check passed with the arm gone.
+    fn body(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]\nmod usage_dispatch") {
+            Some(k) => &src[..k],
+            None => src,
+        }
+    }
+
+    fn missing(src: &str) -> Vec<String> {
+        let src = body(src);
+        let u = usage_commands(src);
+        let d = dispatch_commands(src);
+        u.difference(&d).cloned().collect()
+    }
+
+    #[test]
+    fn every_usage_command_is_dispatchable() {
+        let src = include_str!("main.rs");
+        let u = usage_commands(src);
+        assert!(
+            u.contains("readwindow") && u.contains("run") && u.contains("plan"),
+            "the usage parser found {u:?}; it is not reading the COMMANDS block"
+        );
+        let missing = missing(src);
+        assert!(
+            missing.is_empty(),
+            "these commands are documented in the usage text but have no `match` arm in main: \
+             {missing:?}. A usage line is a claim; the arm is the behaviour."
+        );
+    }
+
+    /// **Firing control.** Delete the `readwindow` arm from a copy of this file's own text and the
+    /// check must name it. If this test ever passes with the arm gone, the check above is dead.
+    #[test]
+    fn control_a_removed_arm_is_reported() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("        \"readwindow\" => {")
+            .expect("the arm is present to begin with");
+        // Cut from the arm to the next `// ---- ` banner, which is the next command's comment.
+        let rest = &src[start + 10..];
+        let cut = rest
+            .find("        // ---")
+            .map(|k| start + 10 + k)
+            .unwrap_or(src.len());
+        let doctored = format!("{}{}", &src[..start], &src[cut..]);
+        assert_eq!(missing(&doctored), vec!["readwindow".to_string()]);
+    }
 }

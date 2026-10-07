@@ -69,7 +69,7 @@ verification below describes a fixed revision and not a moving target.
 ### 0.2 The Lead's two MEASURED facts, used as oracles below
 
 1. **`a9pwn ident` (Lead, MEASURED, read-only, over the wire)** read the string descriptor:
-   `CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:<masked> IBFL:1C SRTG:[iBoot-2234.0.0.2.22]`
+   `CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 ECID:[REDACTED-IDENTITY] IBFL:1C SRTG:[iBoot-2234.0.0.2.22]`
    — **lowercase `iBoot`, space-separated.** The uppercase `IBOOT` seen earlier came from the
    Windows PnP instance path, which normalises. The wire descriptor is canonical. HANDOFF §3's
    `SRTG (boot) = IBOOT-2234.0.0.2.22` is the PnP form, not the wire form — same string, different

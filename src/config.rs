@@ -65,6 +65,14 @@ pub struct SocConfig {
     pub ttbr0_vrom_off: u64,
     /// Only the non-A9 `usb_rop_callbacks` path uses this (gaster.c:1102).
     pub ttbr0_sram_off: u64,
+    /// The ROM's constant DFU receive base (`0x180380000`, gaster.c:637) — TWO
+    /// roles that review/06 §7 S1 learned to separate: (1) the one-shot callback
+    /// target (the pwn payload is DNLOADed here and called ONCE — it must never
+    /// move), and (2) gaster's command mailbox (the handler struct's
+    /// `insecure_memory_base`). For the boot/Point-A flow, role (2) MOVES to
+    /// [`S1_MAILBOX_BASE`] (the base+L append-relocation) so a staged image at
+    /// base..base+L and the command channel never collide; role (1) never moves.
+    /// `build_payload_variant`'s `mailbox` argument is exactly this split.
     pub insecure_memory_base: u64,
     pub dfu_handle_bus_reset: u64,
     pub dfu_handle_request: u64,
@@ -112,6 +120,16 @@ impl SocConfig {
         }
     }
 }
+
+/// review/06 §7 S1's append-relocation offset `L`, and the relocated command
+/// mailbox it buys (`base + L`). Geometry parity with `a9boot-host`'s `boot.rs`
+/// (`APPEND_L` / `MAILBOX_BASE` — the two crates MUST agree): the staged stage-1
+/// image occupies `0x180380000..0x180380000+L` and the mailbox/reply/payload
+/// area lives at `0x1803C0000` upward, so they never share a byte
+/// (`BOOT_WINDOW_COLLISION` refuses a geometry where they would).
+pub const S1_APPEND_L: u64 = 0x4_0000;
+/// The relocated command mailbox, `S1_APPEND_L` past the receive base.
+pub const S1_MAILBOX_BASE: u64 = 0x1_803C_0000;
 
 /// CPID 0x8003 — s8003 "Malta", the die on our attached iPhone SE 1st gen.
 ///
@@ -258,9 +276,9 @@ mod tests {
 
     /// The live capture of our attached unit, verbatim from `types.rs`.
     const LIVE_8003: &str = "CPID:8003 CPRV:01 CPFM:03 SCEP:01 BDID:02 \
-                             ECID:00112233445566AA IBFL:1C SRTG:[IBOOT-2234.0.0.2.22]";
+                             ECID:[REDACTED-IDENTITY] IBFL:1C SRTG:[IBOOT-2234.0.0.2.22]";
     const LIVE_8000: &str = "CPID:8000 CPRV:20 CPFM:03 SCEP:01 BDID:04 \
-                             ECID:0011223344556677 IBFL:1C SRTG:[iBoot-2234.0.0.3.3]";
+                             ECID:[REDACTED-IDENTITY] IBFL:1C SRTG:[iBoot-2234.0.0.3.3]";
 
     #[test]
     fn table_holds_exactly_the_two_a9_dies() {
@@ -379,7 +397,7 @@ mod tests {
     #[test]
     fn resolves_the_windows_underscore_descriptor() {
         let id = ident(
-            "CPID:8003_CPRV:01_CPFM:03_SCEP:01_BDID:02_ECID:00112233445566AA_IBFL:1C_\
+            "CPID:8003_CPRV:01_CPFM:03_SCEP:01_BDID:02_ECID:[REDACTED-IDENTITY]_IBFL:1C_\
              SRTG:[IBOOT-2234.0.0.2.22]",
         );
         let (cfg, kind) = config_for_identity(&id).expect("underscore form");
